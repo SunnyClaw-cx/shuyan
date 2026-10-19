@@ -8,16 +8,23 @@ version = "0.2.0"
 description = "枢言（Shuyan）—— 中文原生编程语言与自研编译器工具链"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Proprietary" }
+license = { text = "MIT" }
 keywords = ["chinese", "programming-language", "compiler", "interpreter", "枢言"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Natural Language :: Chinese (Simplified)",
     "Topic :: Software Development :: Compilers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
 ]
 
 [project.scripts]
 sy = "shuyan.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/SunnyClaw-cx/shuyan"
+Repository = "https://github.com/SunnyClaw-cx/shuyan"
+Changelog = "https://github.com/SunnyClaw-cx/shuyan/blob/main/CHANGELOG.md"
 
 [tool.setuptools]
 packages = ["shuyan"]
