@@ -1,0 +1,91 @@
+name: 功能建议
+description: 提出新特性、新语法或改进建议
+title: "[建议] "
+labels: ["增强"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你的建议。枢言对语言特性有明确取舍，请尽量说明**使用场景**而不仅是「想要什么」。
+
+        建议先阅读 [`docs/WHITEPAPER.md`](../blob/main/docs/WHITEPAPER.md)
+        与 [`docs/SPEC.md`](../blob/main/docs/SPEC.md) —— 你的想法可能已被讨论过。
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已阅读 WHITEPAPER 与 SPEC 的相关章节
+          required: true
+        - label: 我已搜索过现有 Issue 与「被否决设计」清单
+          required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: 建议类型
+      options:
+        - 语言语法（新语句 / 新表达式）
+        - 类型系统（结构体 / 枚举 / 泛型）
+        - 标准库（新增函数或模块）
+        - 工具链（格式化器 / Lint / CLI / REPL / 调试器）
+        - 性能
+        - 文档
+        - 工程与生态（包管理 / 构建 / CI）
+    validations:
+      required: true
+
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 使用场景
+      description: |
+        描述你**实际想写**的程序，以及当前写不出来 / 写得很别扭的地方。
+        请用具体代码示例，而非抽象描述。
+      render: text
+      placeholder: |
+        我想写一个处理订单的程序，但订单有 8 个字段，
+        目前只能用映射，运行时才发现字段名拼错……
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议的写法
+      description: 你希望枢言长什么样？请写出中文源码示例
+      render: text
+      placeholder: |
+        结构体 订单：
+            编号：文本
+            金额：小数
+        结束
+    validations:
+      required: false
+
+  - type: textarea
+    id: ambiguity
+    attributes:
+      label: 你考虑过的歧义风险
+      description: |
+        中文编程的核心难点是词法切分与语义歧义。
+        请说明你的提议**会不会与现有语法冲突**（例如 `数据中台` 之类的词会不会被切坏）。
+        这个字段对本项目非常重要。
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternative
+    attributes:
+      label: 替代方案
+      description: 目前你能用什么办法勉强实现？为什么不够好？
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充说明
+    validations:
+      required: false

@@ -1,0 +1,226 @@
+name: 持续集成
+
+on:
+  push:
+    branches: [main, master, dev]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: "1"
+
+jobs:
+  # ── 主测试矩阵：多平台 × 多 Python 版本 ──────────────────────────
+  测试:
+    name: 测试 · ${{ matrix.os }} · Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+        exclude:
+          # 减少非必要组合，保留全平台覆盖与版本覆盖
+          - os: macos-latest
+            python: "3.10"
+          - os: macos-latest
+            python: "3.11"
+          - os: windows-latest
+            python: "3.11"
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: 显示环境信息
+        run: |
+          python --version
+          python -c "import sys, platform; print(sys.executable); print(platform.platform())"
+
+      - name: 零依赖自检（确认未引入第三方包）
+        shell: bash
+        run: |
+          python - <<'PY'
+          import ast, pathlib, sys
+          STD = set(sys.stdlib_module_names) | {"shuyan"}
+          bad = []
+          for p in pathlib.Path("shuyan").glob("*.py"):
+              tree = ast.parse(p.read_text(encoding="utf-8"))
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Import):
+                      for a in node.names:
+                          root = a.name.split(".")[0]
+                          if root not in STD:
+                              bad.append(f"{p}: import {a.name}")
+                  elif isinstance(node, ast.ImportFrom):
+                      if node.level == 0 and node.module:
+                          root = node.module.split(".")[0]
+                          if root not in STD:
+                              bad.append(f"{p}: from {node.module} import ...")
+          if bad:
+              print("发现第三方依赖：")
+              print("\n".join(bad))
+              sys.exit(1)
+          print("零依赖检查通过：未引入任何第三方包。")
+          PY
+
+      - name: 运行内置自测
+        run: python sy.py 测试
+
+      - name: 运行标准化单元测试
+        run: python -m unittest discover -s tests -v
+
+      - name: 运行全部示例程序
+        shell: bash
+        run: |
+          set -e
+          for f in examples/*.sy; do
+            echo "── 运行 $f ──"
+            python sy.py 运行 "$f"
+          done
+
+      - name: 静态检查全部示例（必须零问题）
+        shell: bash
+        run: |
+          set -e
+          python sy.py 检查 examples/*.sy
+
+      - name: 校验标准库文档与实现同源
+        shell: bash
+        run: |
+          set -e
+          python tools/gen_stdlib_doc.py
+          git diff --exit-code -- docs/STDLIB.md \
+            || { echo "::error::docs/STDLIB.md 与实现不同步，请重跑 tools/gen_stdlib_doc.py"; exit 1; }
+
+      - name: 校验格式化器幂等性
+        shell: bash
+        run: |
+          set -e
+          python - <<'PY'
+          import pathlib, subprocess, sys, tempfile, shutil
+          files = sorted(pathlib.Path("examples").glob("*.sy"))
+          for f in files:
+              with tempfile.TemporaryDirectory() as td:
+                  tmp = pathlib.Path(td) / f.name
+                  shutil.copy(f, tmp)
+                  subprocess.run([sys.executable, "sy.py", "格式化", str(tmp), "--写入"], check=True)
+                  once = tmp.read_text(encoding="utf-8")
+                  subprocess.run([sys.executable, "sy.py", "格式化", str(tmp), "--写入"], check=True)
+                  twice = tmp.read_text(encoding="utf-8")
+                  if once != twice:
+                      print(f"::error::{f} 格式化不幂等")
+                      sys.exit(1)
+          print("格式化器幂等性校验通过。")
+          PY
+
+      - name: 运行性能基准（冒烟，验证可执行）
+        shell: bash
+        run: |
+          if [ -f benchmarks/run_bench.py ]; then
+            python benchmarks/run_bench.py --quick
+          else
+            echo "跳过：基准套件尚未就位。"
+          fi
+
+  # ── 覆盖率（仅 Linux + 3.13，避免矩阵膨胀） ─────────────────────
+  覆盖率:
+    name: 覆盖率 · Python 3.13
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: 使用 trace 模块统计自测覆盖率
+        run: |
+          python -m trace --count --coverdir=/tmp/cov sy.py 测试
+          python - <<'PY'
+          import pathlib, re
+          total = hit = 0
+          for p in pathlib.Path("/tmp/cov").rglob("shuyan.*.cover"):
+              for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+                  m = re.match(r"^\s*(\d+|>>>>>>)\s*:\s*(.+)$", line)
+                  if not m:
+                      continue
+                  text = m.group(2).strip()
+                  if not text or text.startswith("#"):
+                      continue
+                  total += 1
+                  if m.group(1) != ">>>>>>":
+                      hit += 1
+          if total:
+              print(f"语句覆盖：{hit}/{total} = {hit/total:.1%}")
+          else:
+              print("未能解析覆盖率输出。")
+          PY
+
+  # ── 文档一致性 ──────────────────────────────────────────────────
+  文档:
+    name: 文档一致性
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: 检查文档中引用的文件是否存在
+        shell: bash
+        run: |
+          set -e
+          python - <<'PY'
+          import pathlib, re, sys
+          missing = []
+          md_files = list(pathlib.Path(".").glob("*.md")) + list(pathlib.Path("docs").glob("*.md"))
+          pat = re.compile(r"\[[^\]]*\]\(([^)#]+?)(?:#[^)]*)?\)")
+          for md in md_files:
+              for m in pat.finditer(md.read_text(encoding="utf-8")):
+                  target = m.group(1).strip()
+                  if target.startswith(("http://", "https://", "mailto:")):
+                      continue
+                  p = (md.parent / target).resolve()
+                  if not p.exists():
+                      missing.append(f"{md}: 链接指向不存在的文件 → {target}")
+          if missing:
+              print("\n".join(missing))
+              sys.exit(1)
+          print("文档内部链接检查通过。")
+          PY
+
+      - name: 检查 CHANGELOG 是否覆盖当前版本
+        run: |
+          V=$(python -c "import shuyan; print(shuyan.__version__)")
+          grep -q "## \[$V\]" CHANGELOG.md \
+            || { echo "::error::CHANGELOG.md 缺少版本 $V 的条目"; exit 1; }
+          echo "CHANGELOG 已覆盖版本 $V。"
+
+  # ── 打包可用性 ──────────────────────────────────────────────────
+  打包:
+    name: 打包与安装验证
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: 构建 wheel 与 sdist
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+      - name: 安装并验证命令行入口
+        run: |
+          python -m pip install dist/*.whl
+          sy 版本
+          sy 测试
+          echo '输出("打包验证通过")' > /tmp/smoke.sy
+          sy 运行 /tmp/smoke.sy

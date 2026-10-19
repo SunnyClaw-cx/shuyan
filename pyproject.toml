@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shuyan"
+version = "0.2.0"
+description = "枢言（Shuyan）—— 中文原生编程语言与自研编译器工具链"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+keywords = ["chinese", "programming-language", "compiler", "interpreter", "枢言"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Natural Language :: Chinese (Simplified)",
+    "Topic :: Software Development :: Compilers",
+]
+
+[project.scripts]
+sy = "shuyan.cli:main"
+
+[tool.setuptools]
+packages = ["shuyan"]

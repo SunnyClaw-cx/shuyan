@@ -1,0 +1,42 @@
+# Git 属性：统一换行与语言识别
+# https://git-scm.com/docs/gitattributes
+
+# 默认：文本文件按 LF 存库，检出时自动转换
+* text=auto eol=lf
+
+# 明确二进制文件
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.whl binary
+*.exe binary
+*.dll binary
+
+# 明确文本文件
+*.py   text eol=lf
+*.sy   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.cfg  text eol=lf
+*.ini  text eol=lf
+
+# 枢言源码：让 GitHub 识别为自定义语言（配合 .gitattributes 的 linguist）
+*.sy linguist-language=Shuyan
+
+# 文档不计入语言统计，避免中文字数虚高
+docs/**/*.md linguist-documentation
+*.md linguist-documentation
+
+# 生成物不计入统计
+docs/STDLIB.md linguist-generated
+
+# diff 视图更友好
+*.py diff=python

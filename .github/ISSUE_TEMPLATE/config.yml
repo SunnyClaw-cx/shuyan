@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用问题与讨论
+    url: https://github.com/SunnyClaw-cx/shuyan/discussions
+    about: 不确定是不是缺陷？想讨论设计取舍？请到 Discussions。
+  - name: 语言规范（SPEC）
+    url: https://github.com/SunnyClaw-cx/shuyan/blob/main/docs/SPEC.md
+    about: 语言的唯一权威定义。报缺陷前建议先对照规范确认预期行为。
+  - name: 被否决的设计
+    url: https://github.com/SunnyClaw-cx/shuyan/blob/main/docs/WHITEPAPER.md
+    about: 提交建议前请先确认你的想法是否已被讨论并否决。
