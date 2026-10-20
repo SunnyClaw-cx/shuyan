@@ -32,8 +32,9 @@ from .diagnostics import (
 )
 from .errors import (
     BreakSignal, ContinueSignal, ExitSignal, ReturnSignal, ShuyanThrow,
-    error, make_error,
+    describe_error_value, error, make_error,
 )
+from .names import MODULE_NAMES
 from .source import Span
 from .values import (
     NIL, EnumMember, ShuyanMap, ShuyanStruct, ShuyanType,
@@ -169,13 +170,10 @@ class Interpreter:
         self.stdlib.emit(self._render_runtime([diag], []))
 
     def _report_uncaught(self, exc: ShuyanThrow) -> None:
-        value = exc.value
-        if isinstance(value, ShuyanMap):
-            info = display(value.data.get("信息", ""))
-            kind = display(value.data.get("类型", "错误"))
-            message = f"{kind}：{info}"
-        else:
-            message = display(value)
+        # **渲染收敛为唯一入口**：这里曾自己写一份 `类型：信息`，
+        # 与 `ShuyanThrow._describe` 各写各的，于是新增的「提示」字段
+        # 只出现在一边（CLI 静默丢掉提示，实测踩到）。
+        message = describe_error_value(exc.value)
         span = exc.span or Span(0, 0, 0, 0)
         diag = Diagnostic("D4001", "程序抛出了没有被捕获的异常：" + message,
                           span, Severity.ERROR,
@@ -670,14 +668,11 @@ class Interpreter:
                 raise error("除以零", "取余的除数不能是 0。", 运算符="%")
             return left % right
         if op == "^":
-            try:
-                result = left ** right
-            except (OverflowError, ZeroDivisionError):
-                raise error("运算错误", f"计算 {left} ^ {right} 失败。")
-            if isinstance(result, complex):
-                raise error("运算错误",
-                            "负数的小数次幂结果是复数，枢言 v0.1 不支持复数。")
-            return result
+            # **收敛为唯一入口**：`^` 与核心函数 `次方` 是同一语义，
+            # 必须共用实现。此前这里另写了一份幂运算，于是
+            # 「超大整数的量级防护」只加在了 `次方` 上，`^` 依旧会崩 ——
+            # 这正是项目铁律「同一语义两处实现必然分叉」的又一实例。
+            return self.stdlib._power(left, right)
         return NIL
 
     def _eval_Logical(self, node: Logical):
@@ -828,9 +823,40 @@ class Interpreter:
             # 列表/文本的“方法”尚不开放，给出明确提示而非静默空值
             raise error("属性错误",
                         f"「{type_name(target)}」没有「{key}」属性。",
-                        属性=key)
+                        属性=key,
+                        提示=self._shadow_hint(node.target, key))
         raise error("属性错误",
-                    f"「{type_name(target)}」没有「{key}」属性。")
+                    f"「{type_name(target)}」没有「{key}」属性。",
+                    提示=self._shadow_hint(node.target, key))
+
+    def _shadow_hint(self, target: Node, key: str) -> str | None:
+        """成员访问失败时，判断是不是**局部名字遮蔽了内置模块**。
+
+        实测场景（`projects/应收对账/报表.sy`）：
+            引入 "文本"
+            请 左对齐(文本, 宽度)          // 形参 `文本` 遮蔽了模块 `文本`
+                返回 文本.填充(...)        // 这里的 `文本` 是那个字符串参数
+            结束
+        用户拿到的报错是「「文本」没有「填充」属性」，而文本模块里明明有
+        `填充` —— 报错把人往错方向带。这里补一句「你本地有个叫 X 的东西
+        把模块挡住了」，让根因可见。
+        """
+        if not isinstance(target, Identifier):
+            return None
+        name = target.name
+        # 只在「内置模块同名」时提示 —— 否则会对着普通字段错误乱猜。
+        if name not in MODULE_NAMES:
+            return None
+        # 再收一道：该内置模块**确实有**这个名字的成员，才说明用户
+        # 本意是访问模块成员，只是被同名局部名字挡住了。
+        if key not in self.stdlib.modules.get(name, ()):
+            return None
+        holder = self.env.get(name)
+        if not holder[0] or isinstance(holder[1], ShuyanMap):
+            return None
+        return (f"注意：当前作用域里有个变量 / 参数也叫「{name}」，"
+                f"它把内置模块「{name}」挡住了 —— `{name}.{key}` "
+                f"取到的是那个变量，不是模块。给它换个名字即可。")
 
     def _is_module_namespace(self, target: Node) -> bool:
         """判断成员访问的目标是否是一个**模块命名空间**。"""

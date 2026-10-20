@@ -63,13 +63,16 @@ class ShuyanMap:
         return self.data.get(key, default)
 
     def set(self, key, value) -> None:
-        self.data[key] = value
+        self.data[_ensure_hashable(key)] = value
 
     def __len__(self) -> int:
         return len(self.data)
 
     def __contains__(self, key) -> bool:
-        return key in self.data
+        try:
+            return _ensure_hashable(key) in self.data
+        except TypeError:
+            return False
 
     def __bool__(self) -> bool:
         return len(self.data) > 0
@@ -77,6 +80,30 @@ class ShuyanMap:
     def __repr__(self) -> str:
         # 走容器渲染的唯一实现，不在这里另写一份。
         return _render(self, _show_repr)
+
+
+def _ensure_hashable(key):
+    """映射键必须可哈希（SPEC §5.1：键须可哈希）。
+
+    列表 / 映射 / 结构体作为键在多数语言里都不允许（可变对象做键会让
+    「取回来」变得无意义）。此处**不是**要禁止它们 —— 而是要**报中文**：
+    此前直接落 Python dict，用户看到的是英文的
+    `unhashable type: 'list'`，既看不懂也关联不到自己写的那一行。
+
+    用「类型名字典 + 容器类型」判定，不依赖 Python 的 `hash()` 试探 ——
+    试探对某些类型有副作用，且报错信息无法给出枢言类型名。
+
+    `error` 在函数内**延迟导入**：`errors.py` 顶层导入了本模块的
+    `ShuyanMap`，若本模块顶层再导入 `errors` 会形成循环导入。
+    """
+    if isinstance(key, (ShuyanMap, ShuyanStruct, list)):
+        from .errors import error
+        raise error("类型错误",
+                    f"映射的键不能是「{type_name(key)}」。"
+                    "键必须可哈希，请改用整数、文本、布尔或小数"
+                    "（需要以复合值为键时，可先转成文本）。",
+                    实际=type_name(key))
+    return key
 
 
 @dataclass
@@ -243,6 +270,11 @@ def format_number(value: float) -> str:
     整数值得显示为 `20.0`（明确它是小数）；长尾小数按有效数字截断到
     12 位，避免 `86.33333333333333` 这类输出淹没用户。**这仅是展示层
     的处理，数值本身不做任何精度损失** —— 参与运算的仍是原始值。
+
+    截断后要**补回 `.0`**：`0.01` 累加 100 次得到的是
+    `1.0000000000000007`，它 `is_integer()` 为假（有尾差），但截断到
+    12 位有效数字后就是 `1`。若直接返回 `1`，就与 `输出(1.0)` → `1.0`
+    不一致 —— 同一个数学结果出现两种写法，是展示层的缺陷而非数值问题。
     """
     if value != value:                      # NaN
         return "非数"
@@ -253,6 +285,9 @@ def format_number(value: float) -> str:
     text = repr(value)
     if len(text) > 15 and "e" not in text and "E" not in text:
         text = f"{value:.12g}"
+        # 截断后若已是「整数值」，补 `.0` 保持与整数小数一致的写法。
+        if "e" not in text and "E" not in text and "." not in text:
+            text += ".0"
     return text
 
 

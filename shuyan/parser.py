@@ -18,7 +18,8 @@ from .ast_nodes import (
     Unary, Use, VarDecl, While,
 )
 from .diagnostics import (
-    Diagnostic, E_COMPARE_CHAIN, E_EXPECTED_EXPRESSION, E_EXPECTED_TOKEN,
+    Diagnostic, E_COMPARE_CHAIN, E_DISCARDED_EXPR, E_EXPECTED_EXPRESSION,
+    E_EXPECTED_TOKEN,
     E_NO_MEMBER, E_NO_OVERLOAD, E_REDEFINED, E_STRAY_END, E_UNCLOSED_BLOCK,
     E_UNEXPECTED_TOKEN, ParseError, Severity,
 )
@@ -444,7 +445,52 @@ class Parser:
 
         self._guard_trailing_tokens(start_span)
         self._skip_terminators()
+        self._guard_discarded_expr(expr, start_span)
         return ExprStmt(span=start_span, expr=expr)
+
+    def _guard_discarded_expr(self, expr: Node, span: Span) -> None:
+        """表达式语句「算完就丢」⇒ 报错，而不是静默丢弃。
+
+        **实测踩到的真实缺陷**（企业级工程 `projects/应收对账/报表.sy`）：
+
+            请 表头()
+                返回 右对齐("序号", 4) + "  "
+                    + 左对齐("单号", 14) + "  "     // 行首 `+`
+                    ...
+            结束
+
+        枢言的续行规则是**行尾运算符**续行（SPEC §2.x）。行首的 `+`
+        不会续行，于是它被当成**新语句**的开始：一元正号表达式。
+        整段拼接语句就此断裂，`+ 左对齐("单号", 14) + "  "` 被当成
+        「算出来就扔掉」的语句 —— **不报错、不提醒、结果少了一整列**。
+
+        报表标题行、明细行因此少掉全部左对齐列；用户看到的是「结果不对」，
+        却找不到任何报错。这正是本项目最危险的一类缺陷
+        （错误结果 + 无人察觉），必须把它变成一句可读的提示。
+
+        **为什么是报错而非自动续行**：自动把行首运算符接回上一行，会改变
+        语言语义（`-x` 独立成句就不再合法），也违背「规则确定」的承诺。
+        规范已冻结，故只把「沉默」改为「响亮」，并给出改法。
+        """
+        if isinstance(expr, Call):
+            return                      # 函数调用有副作用，是正常语句
+        if isinstance(expr, (Identifier, Member, Index)):
+            # `甲` / `甲.字段` / `甲[0]` 独立成句虽无效果，但常是**调试残留**
+            # 或从别的语言带过来的习惯，不算「拼接断裂」，保留宽容。
+            return
+        # 到这里只剩「纯计算」结果：算术 / 比较 / 逻辑 / 一元 / 字面量。
+        # 它们没有任何副作用，值一算出来就没了。
+        if isinstance(expr, (Binary, Compare, Logical, Unary, Ternary,
+                             Literal)):
+            self._error(
+                E_DISCARDED_EXPR,
+                "这条语句算出结果就丢掉了，没有任何效果"
+                "（可能是上一行的拼接被这里的运算符截断了）。",
+                span,
+                ["枢言的续行规则要求运算符放在上一行行尾，"
+                 "行首运算符不会接续上一行",
+                 "把运算符挪到上一行行尾，或用圆括号把整个表达式括起来",
+                 "若确实想丢弃结果，请显式写成 `_ = 表达式`"])
 
     def _guard_trailing_tokens(self, span: Span) -> None:
         """语句解析完却还有剩余记号 ⇒ 明确报错，而不是静默丢弃。

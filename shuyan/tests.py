@@ -116,6 +116,39 @@ def expect_runtime_error(source: str, must_contain: str) -> None:
           f"运行期输出里没有「{must_contain}」：{out[:200]}")
 
 
+def compile_diags(source: str) -> list:
+    """跑一遍词法→语法→语义，返回全部诊断（含警告）。
+
+    解析/词法层抛出的诊断也要收进来 —— 否则「解析期拦截」的用例
+    根本看不到诊断，测试会误以为「没报错」。
+    """
+    try:
+        program = Parser(Lexer(source).tokenize()).parse()
+    except (LexError, ParseError) as exc:
+        return list(exc.diagnostics)
+    analyzer = Analyzer(StdLib())
+    _, diags = analyzer.analyze(program)
+    return list(diags)
+
+
+def expect_warn(source: str, code: str, must_contain: str = "") -> None:
+    """验证编译期产生指定**提醒**（警告），且文案含关键片段。
+
+    提醒与错误同等重要：警告码写错的类别名曾把人往错方向带，
+    故此处一并锁住「码 + 文案」。
+    """
+    diags = compile_diags(source)
+    warns = [d for d in diags
+             if getattr(d.severity, "name", "") == "WARNING"]
+    codes = [d.code for d in warns]
+    if code not in codes:
+        all_codes = [d.code for d in diags]
+        raise Failure(f"期望提醒 {code}，实际得到 {all_codes or '(无诊断)'}")
+    joined = " ".join(d.message for d in warns if d.code == code)
+    if must_contain and must_contain not in joined:
+        raise Failure(f"提醒文案里没有「{must_contain}」：{joined}")
+
+
 def expect_hint(source: str, code: str, must_contain: str) -> None:
     """验证编译期报错**同时**给出了指定建议（hints）。
 
@@ -498,23 +531,35 @@ def test_negative_semantic():
 
 @group("负例·一元运算符续行建议")
 def test_negative_unary_hint():
-    """一元 `+` / `-` 拼到文本上时报错，**必须**附带续行写法建议。
+    """行首运算符断行**必须**在解析期就报错，并给出续行写法建议。
 
-    这是 `projects/留言板/应用.sy` 实际踩过的坑：长表达式换行时把 `+`
-    写在了**下一行行首**。枢言的续行规则要求运算符留在**上一行行尾**
-    （SPEC §2.7），于是行首的 `+` 被当作一元运算符，拼到文本上自然报
-    「运算符不能作用在文本上」——**错误码没错，但定位完全指错了方向**：
-    用户以为是自己把字符串拼错了，实际是换行位置的问题。
+    这是 `projects/留言板/应用.sy` 实际踩过的坑，又在企业级工程
+    `projects/应收对账/报表.sy` 上以更严重的形式复现：长表达式换行时把
+    `+` 写在了**下一行行首**。枢言的续行规则要求运算符留在**上一行行尾**
+    （SPEC §2.7），于是行首的 `+` 被当成新语句。
 
-    单说「该运算符需要数字」不足以让人改对，故本用例锁住两条：
-    ① 建议里明确指向「放到上一行行尾」；
-    ② 建议里给出「用圆括号括起来」这条同样可用的替代写法。
+    早期版本只是在**语义期**报「运算符不能作用在文本上」（D3004）——
+    错误码没错，但**定位完全指错了方向**：用户以为是自己把字符串拼错了，
+    实际是换行位置的问题。更糟的是当左边恰好是**数字**时（如
+    `返回 右对齐(...) + "  "\n + 左对齐(...)`），D3004 都不会报——
+    整条语句被当成「算完就扔」的表达式语句**静默丢弃**，报表少一整列，
+    而用户看不到任何报错。
+
+    现在改由解析期的 D2012 拦下（`_guard_discarded_expr`），在**根因处**
+    给出一句能直接照做的提示。本用例锁住三条：
+    ① 错误码是 D2012（解析期，不再拖到语义期）；
+    ② 建议里明确指向「放到上一行行尾」；
+    ③ 建议里给出「用圆括号括起来」这条同样可用的替代写法。
     """
     # 行首 `+` 拼文本
     expect_hint('定义 甲 = "你好"\n定义 乙: 文本 = 甲\n  + "世界"\n输出(乙)\n',
-                "D3004", "运算符放在上一行行尾")
+                "D2012", "运算符放在上一行行尾")
     expect_hint('定义 甲 = "你好"\n定义 乙: 文本 = 甲\n  + "世界"\n输出(乙)\n',
-                "D3004", "圆括号")
+                "D2012", "圆括号")
+
+    # 行首 `+` 拼数字（D3004 曾整个漏掉的形态，值被静默丢弃）
+    expect_compile_error('定义 甲 = 1 + 2\n  + 3\n输出(甲)\n', "D2012",
+                         "没有任何效果")
 
     # 括号内行首运算符**不应**报错（SPEC §2.7：未闭合括号内部忽略换行）
     expect_output('定义 甲 = "你好"\n定义 乙: 文本 = (甲\n  + "世界")\n输出(乙)\n',
@@ -526,6 +571,9 @@ def test_negative_unary_hint():
 
     # 无续行需求的单行写法不受影响
     expect_output('定义 甲 = "你好"\n输出(甲 + "世界")\n', ["你好世界"])
+
+    # 调用 / 变量 / 成员访问单独成句是正常语句，不受守卫影响
+    expect_output('请 记号()\n    输出("来了")\n结束\n记号()\n', ["来了"])
 
 
 @group("负例·参数个数")
@@ -1270,6 +1318,86 @@ def test_formatter_multichar_operators():
         once, _ = format_source(src)
         twice, _ = format_source(once)
         expect_eq(twice, once, f"格式化不幂等：{src}")
+
+
+@group("负例·表达式语句不得静默丢弃")
+def test_negative_discarded_expr():
+    """表达式语句的值算完就丢 ⇒ 必须报 D2012，而不是静默丢弃。
+
+    **这是企业级工程 `projects/应收对账/报表.sy` 上实测踩到的真缺陷**：
+    长表达式换行时把 `+` 写在**下一行行首**（枢言要求写在上一行行尾），
+    行首的 `+` 被当成新语句。当左边是数字时（`右对齐(...) + "  "`），
+    连语义期的 D3004 都不会报 —— 整条拼接被当成「算完就扔」的表达式
+    语句**静默丢弃**，报表少一整列却零报错。
+
+    静默丢弃是本项目最危险的一类缺陷（结果错 + 无人察觉），故本用例
+    把它锁死在**解析期**：错误码 D2012，且提示指向「运算符挪到上一行行尾」。
+    """
+    # 行首 `+`：拼接被截断（左为数字，D3004 曾整个漏掉）
+    expect_compile_error('定义 甲 = 1\n定义 乙 = 甲 + 2\n  + 3\n输出(乙)\n',
+                         "D2012", "没有任何效果")
+    # 行首 `-` 同理
+    expect_compile_error('定义 甲 = 1\n  甲 - 2\n  - 3\n', "D2012", "没有任何效果")
+    # 纯字面量独立成句
+    expect_compile_error('1 + 2\n', "D2012", "没有任何效果")
+    # 比较 / 逻辑结果同样无副作用
+    expect_compile_error('1 < 2\n', "D2012", "没有任何效果")
+
+    # **不得误报**：函数调用 / 变量 / 成员 / 索引单独成句是正常语句
+    expect_output('请 记号()\n    输出("来了")\n结束\n记号()\n', ["来了"])
+    expect_output('定义 甲 = 1\n甲\n输出("过")\n', ["过"])
+    expect_output('类型 点 = {横: 整数}\n定义 甲 = 点(横 是 1)\n甲.横\n输出("过")\n',
+                  ["过"])
+    expect_output('定义 表 = [1, 2]\n表[0]\n输出("过")\n', ["过"])
+
+
+@group("负例·遮蔽内置名提醒")
+def test_warn_shadow_builtin():
+    """形参 / 变量与内置模块同名 ⇒ 必须在**定义处**提醒（W4001）。
+
+    真因场景：`请 左对齐(文本, 宽度)` 的形参 `文本` 遮蔽了内置模块 `文本`，
+    于是函数体里的 `文本.填充(...)` 取到的是那个参数。报错发生在调用处、
+    真因在定义处 —— 提醒前移到定义处，才能一眼看到是名字挡了路。
+    """
+    # 形参遮蔽内置模块
+    expect_warn('引入 "文本"\n请 甲(文本)\n    返回 文本.填充(文本, 5)\n结束\n',
+                "W4001", "与内置模块「文本」同名")
+    # 变量遮蔽内置模块
+    expect_warn('引入 "列表"\n请 甲()\n    定义 列表 = [1]\n    返回 长度(列表)\n结束\n',
+                "W4001", "与内置模块「列表」同名")
+    # 变量遮蔽内置函数
+    expect_warn('请 甲()\n    定义 长度 = 3\n    返回 长度\n结束\n',
+                "W4001", "与内置函数「长度」同名")
+    # 循环变量遮蔽内置模块
+    expect_warn('引入 "文本"\n遍历 [1] 中的每个 文本\n    输出(文本)\n结束\n',
+                "W4001", "与内置模块「文本」同名")
+
+    # **不得误报**：普通名字不受影响
+    diags = compile_diags('请 甲(原文)\n    返回 原文\n结束\n输出(甲(1))\n')
+    check(not any(d.code == "W4001" for d in diags),
+          "普通参数名被误报为遮蔽")
+
+
+@group("负例·运行期提示必须渲染")
+def test_runtime_hint_rendered():
+    """结构化「提示」字段必须出现在 CLI 报错里，不能被静默丢掉。
+
+    遮蔽内置模块时，运行期除了「没有该属性」还多一条提示指明真因。
+    这条提示曾因 `_report_uncaught` 与 `_describe` 各写一份渲染而丢失
+    （只改了其中一处）。本用例锁住「提示必须到达用户眼前」。
+    """
+    src = ('引入 "文本"\n请 甲(原文)\n    返回 文本.填充(原文, 5)\n结束\n'
+           '定义 文本 = 1\n输出(甲(2))\n')
+    # 这里 文本 是全局变量（遮蔽模块），局部参数名是 原文 —— 命中的是全局遮蔽
+    out, code = run_source(src)
+    check(code != 0, "期望运行失败")
+    check("把内置模块「文本」挡住" in out,
+          f"运行期提示没有渲染出来：{out[:300]}")
+
+    # 反过来：正常写法不该出现这条提示
+    out2, code2 = run_source('引入 "文本"\n输出("[", 文本.填充("甲", 5), "]")\n')
+    check(code2 == 0, "正常写法不应失败")
+    check("挡住" not in out2, "正常写法被误报遮蔽提示")
 
 
 @group("Lint·误报防护")

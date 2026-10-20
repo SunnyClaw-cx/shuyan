@@ -34,6 +34,7 @@ from .diagnostics import (
     SemanticError, Severity,
     W_CONST_COND, W_EMPTY_BLOCK, W_SHADOW, W_UNREACHABLE, W_UNUSED,
 )
+from .names import CORE_FUNCTION_NAMES, MODULE_NAMES
 from .source import Span
 from .values import TYPE_ALIASES, can_assign, normalized_type
 
@@ -201,6 +202,9 @@ class Symbol:
     is_global: bool = False
     is_param: bool = False
     has_explicit_type: bool = False
+    # 类型由初始值 `空` 推出（`定义 v = 空`）。此时类型是**待定**的，
+    # 不锁定后续赋值 —— 见 `_check_assign` 的说明。
+    from_nil_init: bool = False
 
 
 class Scope:
@@ -432,6 +436,34 @@ class Analyzer:
         if method is not None:
             method(node)
 
+    def _check_shadow_builtin(self, name: str, span: Span, kind: str) -> None:
+        """检查新名字是否**遮蔽了内置模块 / 核心函数**，并给出可行动提醒。
+
+        **为什么必须在「定义处」提醒**：`请 左对齐(文本, 宽度)` 这样的形参
+        会遮蔽同名内置模块，于是函数体里的 `文本.填充(...)` 取到的是那个
+        参数（一个字符串），运行期报出「「文本」没有「填充」属性」。
+        用户拿着这条报错去文本模块里翻 `填充` —— 那里明明有，于是
+        完全找不到真因（实测踩到：企业级工程 `projects/应收对账/报表.sy`）。
+
+        报错发生在**调用处**，真因在**定义处**。把提醒前移到定义处，
+        一眼就能看到「是这个名字挡了路」。
+        """
+        if name in MODULE_NAMES:
+            self.warn(
+                W_SHADOW,
+                f"{kind}「{name}」与内置模块「{name}」同名；"
+                f"在本作用域里写 `{name}.某成员` 取到的是它，而**不是**模块。",
+                span,
+                [f"给{kind}换个名字（例如 `{name}值` / `原文`）",
+                 f"换名后 `{name}.某成员` 才会回到内置模块"])
+        elif name in CORE_FUNCTION_NAMES:
+            self.warn(
+                W_SHADOW,
+                f"{kind}「{name}」与内置函数「{name}」同名；"
+                f"在本作用域里写 `{name}(...)` 调用的是它，而**不是**内置函数。",
+                span,
+                [f"给{kind}换个名字（例如 `{name}结果`）"])
+
     def _stmt_VarDecl(self, node: VarDecl) -> None:
         if node.is_global:
             target = self.global_scope
@@ -482,7 +514,11 @@ class Analyzer:
 
         sym = Symbol(name=node.name, type=final_type, is_const=node.is_const,
                      span=node.span,
-                     has_explicit_type=declared is not None)
+                     has_explicit_type=declared is not None,
+                     from_nil_init=(declared is None
+                                    and node.init is not None
+                                    and final_type == "空"))
+        self._check_shadow_builtin(node.name, node.span, "变量")
         old = self.scope.define(sym)
         if old is not None and self.scope.is_global_scope():
             self.err(E_REDEFINED,
@@ -503,6 +539,21 @@ class Analyzer:
                          self._undefined_hints(name))
                 return
             sym.used = True
+            # **空值初始化 ⇒ 类型待定，不锁死**。
+            #
+            # `定义 v = 空` 是「先声明、后按条件赋值」这一企业代码高频模式
+            # 的写法。若把类型锁定为「空」，`v = 1` 会报
+            # 「不能把整数赋值给空变量」—— 用户被迫写 `定义 v: 任意 = 空`，
+            # 而这在语义上并没说清任何东西，只是绕开了检查。
+            #
+            # 因此把「由 `空` 推出」视为**占位推断**：首次赋非空值时，
+            # 类型细化为该值的类型（与下方 `ANY` 的细化同一口径）。
+            if sym.from_nil_init:
+                if value_type != "空":
+                    sym.type = value_type
+                    sym.from_nil_init = False
+                self.node_types[id(node)] = value_type
+                return
             self._check_assign(value_type, sym.type, node.value.span, name)
             if sym.is_const:
                 self.err(E_TYPE_MISMATCH,
@@ -598,6 +649,7 @@ class Analyzer:
                      ["用 `列表` 或 `文本` 作遍历对象"])
         elem = "文本" if it == "文本" else ANY
         self._push("block")
+        self._check_shadow_builtin(node.var_name, node.span, "循环变量")
         self.scope.define(Symbol(name=node.var_name, type=elem,
                                  span=node.span, used=True))
         self._loop_depth += 1
@@ -622,6 +674,7 @@ class Analyzer:
         self._push("function")
         for p in node.params:
             pt = normalized_type(p.type_ann) or ANY
+            self._check_shadow_builtin(p.name, p.span, "参数")
             self.scope.define(Symbol(name=p.name, type=pt, span=p.span,
                                      used=True, is_param=True,
                                      has_explicit_type=p.type_ann is not None))
@@ -751,10 +804,25 @@ class Analyzer:
         self._loading_modules.add(real)
 
         try:
+            return self._import_module_file_inner(node, name, full, real)
+        finally:
+            # **必须清理**：否则「同一模块被引入两次」时，第二次会被
+            # 上面那行 `in self._loading_modules` 误判为循环引入，
+            # 直接 `return True` 而**什么都不引入** ⇒ 报「没有定义 模块名」。
+            # 实测症状：同一文件先 `引入 { 某函数 } 从 "甲"`，再
+            # `引入 "甲"`，第二次静默失效。用 finally 而非各分支补齐，
+            # 是因为中途还有多处 `return`（找不到文件、解析失败等）。
+            self._loading_modules.discard(real)
+
+    def _import_module_file_inner(self, node: Use, name: str,
+                                  full: str, real: str) -> bool:
+        from .lexer import Lexer
+        from .parser import Parser
+
+        try:
             with open(full, "r", encoding="utf-8") as f:
                 text = f.read()
         except OSError:
-            self._loading_modules.discard(real)
             return False
 
         sub = Analyzer(self.stdlib)
@@ -803,6 +871,25 @@ class Analyzer:
             {k: v for k, v in sub.enum_types.items() if not k.startswith("_")})
         self.type_aliases.update(
             {k: v for k, v in sub.type_aliases.items() if not k.startswith("_")})
+
+        # **传递引入命名空间**（实测缺陷修复）。
+        #
+        # 若本文件用 `引入 { 某函数 } 从 "甲"`，而 `甲` 内部写了
+        # `引入 "乙"`，则 `乙` 的类型已被上面几行并入本文件 —— 但
+        # `乙` 这个**命名空间名**并没有绑定，于是本文件写 `乙.某枚举.成员`
+        # 会报「没有定义 乙」。用户看到的是「我明明引入了，却说没定义」。
+        #
+        # 两种选择：① 让 `甲` 的传递引入**可见**（本实现）；② 让 `甲`
+        # 内部引入**完全私有**（则调用方无法触及，更接近多数语言的模块
+        # 语义）。此处选 ① 并**显式绑定命名空间**，理由是枢言的模块引入
+        # 本就是「展开式」的（类型已并入），半展开半隐藏才最令人困惑。
+        for inner_name, inner_exports in sub.imported_file_modules.items():
+            if inner_name in self.imported_file_modules:
+                self.imported_file_modules[inner_name] |= set(inner_exports)
+            else:
+                self.imported_file_modules[inner_name] = set(inner_exports)
+                self.global_scope.define(Symbol(name=inner_name, type=ANY,
+                                                span=node.span, used=True))
         return True
 
     def _stmt_TypeDecl(self, node: TypeDecl) -> None:
@@ -1393,7 +1480,18 @@ class Analyzer:
             return ANY
 
         # 目标是否是「裸类型名」？`星期.三` 的 `星期`、`点.横` 的 `点`
+        #
+        # **先查作用域**：若存在同名局部符号（参数或变量），它就是**值**，
+        # 优先于类型名。否则形如 `请 检查信用(客户, ...)` 的参数 `客户`
+        # 会被误判成结构体类型名，报「请先构造成实例」—— 而用户明明
+        # 传的就是实例。实测于 `projects/应收对账/账龄服务.sy`。
+        target_is_value = False
         if isinstance(node.target, Identifier):
+            _sym = self.scope.lookup(node.target.name)
+            if _sym is not None and not _sym.is_function:
+                target_is_value = True
+
+        if isinstance(node.target, Identifier) and not target_is_value:
             tname = node.target.name
             # 以命名空间形式引入的本机模块：`工具.平方` / `领域模型.状态`
             if tname in self.imported_file_modules:

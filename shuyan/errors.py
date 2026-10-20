@@ -28,12 +28,7 @@ class ShuyanThrow(Exception):
         super().__init__(self._describe())
 
     def _describe(self) -> str:
-        if isinstance(self.value, ShuyanMap):
-            info = self.value.data.get("信息")
-            if info is not None:
-                kind = self.value.data.get("类型", "异常")
-                return f"{kind}：{info}"
-        return str(self.value)
+        return describe_error_value(self.value)
 
 
 @dataclass
@@ -58,6 +53,31 @@ class BreakSignal(Exception):
 @dataclass
 class ContinueSignal(Exception):
     pass
+
+
+def describe_error_value(value) -> str:
+    """把异常值渲染成给用户看的中文说明 —— **全项目唯一实现**。
+
+    **为什么必须收敛**：`ShuyanThrow._describe`（Python 异常消息）与
+    解释器 `_report_uncaught`（CLI 报错输出）各自写一遍 `类型：信息`，
+    结构一模一样却各写各的。新增「提示」字段时只改了 `_describe`，
+    于是**结构化提示被静默丢掉**（实测踩到：遮蔽诊断的提示写进了异常值，
+    CLI 却一个字都不显示）。凡「同一语义两处实现必然分叉」，此处合并。
+    """
+    from .values import display
+
+    if isinstance(value, ShuyanMap):
+        info = value.data.get("信息")
+        if info is not None:
+            kind = value.data.get("类型", "异常")
+            text = f"{display(kind)}：{display(info)}"
+            # 结构化「提示」字段必须渲染出来 —— 否则调用方传了
+            # `提示=` 却不出现在报错里，等于没写。
+            hint = value.data.get("提示")
+            if hint:
+                text += f"\n  → {display(hint)}"
+            return text
+    return display(value)
 
 
 def make_error(kind: str, message: str, **extra) -> ShuyanMap:

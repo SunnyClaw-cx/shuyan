@@ -62,6 +62,59 @@ def _want_map(v, fname: str) -> ShuyanMap:
     return v
 
 
+def _int_str_limit() -> int:
+    """Python 允许的「整数转十进制文本」最大位数（默认 4300）。
+
+    该上限由解释器进程决定，故**读取实际值**而非写死常量 ——
+    写死会在用户提高上限后误报。
+    """
+    getter = getattr(sys, "get_int_max_str_digits", None)
+    if getter is None:            # Python < 3.11 无此限制
+        return 1 << 62
+    return getter()
+
+
+def _decimal_digits(n: int) -> int:
+    """估算非负整数的十进制位数（不转成字符串，故不受上述上限影响）。"""
+    if n == 0:
+        return 1
+    # bit_length * log10(2) 已足够精确，末尾 +1 保证不低估。
+    return int(n.bit_length() * 0.3010299956639812) + 1
+
+
+def _round_half_up(value, ndigits=None):
+    """**真·四舍五入**：5 一律进位（区别于 Python 的银行家舍入）。
+
+    `ndigits=None` 返回整数，否则返回指定位数的小数。
+
+    实现走 `Decimal`：先由**浮点的精确十进制表示**构造
+    （`Decimal(float)` 取的是该 float 的真实值，不是 `Decimal(str(x))`
+    那种「先按 17 位有效数字转文本」的近似），再以 `ROUND_HALF_UP`
+    舍入。这样 `2.5` 得 3、`-2.5` 得 -3，符合中文直觉。
+    """
+    from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+
+    try:
+        d = Decimal(value)
+    except (InvalidOperation, ValueError):
+        # 非有限值（inf / nan）保持原样，由显示层处理。
+        return value
+
+    if ndigits is None:
+        q = Decimal(0)
+    else:
+        q = Decimal(1).scaleb(-ndigits)      # 10 ** -ndigits
+
+    try:
+        result = d.quantize(q, rounding=ROUND_HALF_UP)
+    except InvalidOperation:
+        return value
+
+    if ndigits is None:
+        return int(result)
+    return float(result)
+
+
 def _want_iterable(v, fname: str) -> list:
     """可遍历对象：列表 → 元素；文本 → 逐字；映射 → 键；区间 → 列表。"""
     if isinstance(v, list):
@@ -183,8 +236,7 @@ class StdLib:
 
         # --- 数学 ---
         reg("取整", lambda v: int(_want_number(v, "取整")))
-        reg("四舍五入", lambda v, n=0: round(_want_number(v, "四舍五入"),
-                                           _want_int(n, "四舍五入")))
+        reg("四舍五入", self._round)
         reg("取小", lambda a, b: min(_want_number(a, "取小"),
                                     _want_number(b, "取小")))
         reg("最大", self._max)
@@ -309,16 +361,41 @@ class StdLib:
         return min(args)
 
     def _power(self, base, exponent):
-        """幂运算（`^` 的函数形式）。"""
+        """幂运算（`^` 的函数形式）。
+
+        除 `OverflowError` / `ZeroDivisionError` 外，还需拦一类更隐蔽的失败：
+        Python 对**超大整数**的十进制转换设有上限（默认 4300 位），
+        `10 ^ 10000` 的幂运算本身能算出来，但**一旦被转成文本**（输出、
+        拼字符串）就会抛 `ValueError` —— 且抛在**与幂无关的地方**，
+        用户完全无法关联。故在产生结果时就把量级检查掉。
+        """
         b = _want_number(base, "次方")
         e = _want_number(exponent, "次方")
         try:
             result = b ** e
-        except (OverflowError, ZeroDivisionError):
-            raise error("运算错误", f"计算 {b} 的 {e} 次方失败。")
+        except (OverflowError, ZeroDivisionError) as exc:
+            raise error("运算错误",
+                        f"计算 {display(b)} 的 {display(e)} 次方失败"
+                        "（结果超出可表示范围）。") from exc
         if isinstance(result, complex):
             raise error("运算错误",
                         "负数的小数次幂结果是复数，枢言 v0.1 不支持复数。")
+        if isinstance(result, int):
+            # Python 对**整数转十进制文本**设有上限（`sys.get_int_max_str_digits()`，
+            # 默认 4300 位）。幂运算本身能算出 `10 ^ 10000`，但它一旦出现在
+            # `输出` / 字符串拼接里就抛 `ValueError` —— 而且抛在**与幂无关的地方**。
+            # 故在产生结果时就按实际限制拦下，给出与「幂」相关的可行动提示。
+            limit = _int_str_limit()
+            if result >= 0:
+                digits = _decimal_digits(result)
+            else:
+                digits = _decimal_digits(-result)
+            if digits > limit:
+                raise error("运算错误",
+                            f"计算 {display(b)} 的 {display(e)} 次方得到一个"
+                            f"约 {digits} 位的超大整数，超过整数转文本的上限"
+                            f"（{limit} 位），一旦输出就会失败。"
+                            "如需大数运算，请分步取模（`%`）或缩小指数。")
         return result
 
     def _avg(self, lst):
@@ -326,6 +403,91 @@ class StdLib:
         if not items:
             raise error("参数错误", "平均值 的列表为空。")
         return sum(_want_number(x, "平均值") for x in items) / len(items)
+
+    def _round(self, value, ndigits=NIL):
+        """四舍五入（SPEC §6.2）。
+
+        两处刻意的选择：
+
+        1. **不用 Python 的 `round()`**。它做的是**银行家舍入**
+           （round-half-to-even）：`round(2.5)` 得 2、`round(0.5)` 得 0。
+           中文的「四舍五入」是**字面语义**（5 一律进位），两者在
+           `.5` 上必然不同。企业金额场景大量出现 `x.5`，用银行家舍入
+           会得到「看起来算错了」的结果。故显式实现「5 向上」。
+        2. **省略位数时返回整数**。签名表声明返回「整数」，且
+           `四舍五入(1699.0)` 在金额场景就应得到整数 1699。
+           此前实现固定走 `round(v, 0)`，返回的是**小数** 1699.0，
+           与声明不符，也让 `定义 金额: 整数 = 四舍五入(...)` 直接报错。
+        """
+        v = _want_number(value, "四舍五入")
+        if isinstance(v, int) and ndigits is NIL:
+            return v
+        if ndigits is NIL:
+            return _round_half_up(v)
+        n = _want_int(ndigits, "四舍五入")
+        if n < 0:
+            raise error("参数错误",
+                        f"四舍五入 的位数不能是负数，实际收到 {n}。",
+                        函数="四舍五入")
+        return _round_half_up(v, n)
+
+    # ---------------------------------------------------------- 数学（带值域防护）
+    #
+    # 这些成员此前直接调用 `math.*`，一旦传入域外值就**抛出宿主异常**
+    # （Python 的 `ValueError`），用户看到的是英文的 `math domain error`，
+    # 而不是枢言的中文诊断。任何用户可构造的输入都不该让实现层崩溃 ——
+    # 故逐个包一层，把域外输入转成可捕获、可行动的中文异常。
+
+    def _math_sqrt(self, x):
+        v = _want_number(x, "平方根")
+        if v < 0:
+            raise error("运算错误",
+                        f"平方根 要求非负数，实际收到 {v}。",
+                        函数="平方根", 实际=display(v))
+        return math.sqrt(v)
+
+    def _math_log(self, x, base=math.e):
+        v = _want_number(x, "对数")
+        if v <= 0:
+            raise error("运算错误",
+                        f"对数 要求正数，实际收到 {v}。"
+                        "（0 与负数没有实数对数）",
+                        函数="对数", 实际=display(v))
+        b = _want_number(base, "对数")
+        if b <= 0 or b == 1:
+            raise error("运算错误",
+                        f"对数 的底必须是正数且不等于 1，实际收到 {b}。",
+                        函数="对数", 实际=display(b))
+        return math.log(v, b)
+
+    def _math_pow(self, a, b):
+        """幂（模块形式）。与 `^` 走**同一实现**，避免两处语义分叉。"""
+        return self._power(a, b)
+
+    def _math_sin(self, x):
+        return math.sin(_want_number(x, "正弦"))
+
+    def _math_cos(self, x):
+        return math.cos(_want_number(x, "余弦"))
+
+    def _math_tan(self, x):
+        v = _want_number(x, "正切")
+        try:
+            return math.tan(v)
+        except (ValueError, OverflowError) as exc:
+            raise error("运算错误", f"正弦/余弦/正切 计算失败：{v}。") from exc
+
+    def _math_floor(self, x):
+        v = _want_number(x, "向下取整")
+        if isinstance(v, float) and (math.isinf(v) or math.isnan(v)):
+            raise error("运算错误", f"向下取整 不能作用于 {display(v)}。")
+        return math.floor(v)
+
+    def _math_ceil(self, x):
+        v = _want_number(x, "向上取整")
+        if isinstance(v, float) and (math.isinf(v) or math.isnan(v)):
+            raise error("运算错误", f"向上取整 不能作用于 {display(v)}。")
+        return math.ceil(v)
 
     def _range(self, *args):
         """范围(终点) / 范围(起点, 终点) / 范围(起点, 终点, 步长)。终点不含。"""
@@ -585,16 +747,15 @@ class StdLib:
         m["数学"] = {
             "圆周率": math.pi,
             "自然常数": math.e,
-            "正弦": lambda x: math.sin(_want_number(x, "正弦")),
-            "余弦": lambda x: math.cos(_want_number(x, "余弦")),
-            "正切": lambda x: math.tan(_want_number(x, "正切")),
-            "平方根": lambda x: math.sqrt(_want_number(x, "平方根")),
-            "幂": lambda a, b: _want_number(a, "幂") ** _want_number(b, "幂"),
-            "对数": lambda x, base=math.e: math.log(
-                _want_number(x, "对数"), base),
+            "正弦": self._math_sin,
+            "余弦": self._math_cos,
+            "正切": self._math_tan,
+            "平方根": self._math_sqrt,
+            "幂": self._math_pow,
+            "对数": self._math_log,
             "取整": lambda x: int(_want_number(x, "取整")),
-            "向下取整": lambda x: math.floor(_want_number(x, "向下取整")),
-            "向上取整": lambda x: math.ceil(_want_number(x, "向上取整")),
+            "向下取整": self._math_floor,
+            "向上取整": self._math_ceil,
             "绝对值": lambda x: abs(_want_number(x, "绝对值")),
             "最大": self._max,
             "最小": self._min,
