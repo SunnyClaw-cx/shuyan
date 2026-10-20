@@ -132,6 +132,35 @@ def _norm_index(idx: int, n: int) -> int:
 
 
 class StdLib:
+    """标准库：内置函数 + 内置模块。
+
+    `base_dir` 是**多文件工程的路径基准**（主脚本所在目录）。
+    `resolve_module_file` 是模块名 → 完整路径的**唯一解析入口**：
+    语义分析器与解释器都必须走它 —— 两处各写一份候选路径必然分叉
+    （项目铁律「同一语义两处实现必然分叉」），实测症状就是
+    「编译期说找得到、运行期说找不到」。
+    """
+
+    def resolve_module_file(self, name: str) -> str | None:
+        """把模块名解析成**已存在的** .sy 完整路径；找不到返回 None。
+
+        候选顺序（与 SPEC §3.8.1 一致，基准是主脚本目录）：
+          ① 主脚本目录/base_dir 下的 <name>.sy
+          ② 相对路径 <name>.sy（进程 CWD）
+          ③ CWD 下的 <name>.sy
+          ④ 绝对路径（若 name 本身是绝对路径）
+        """
+        import os
+        path = name if name.endswith(".sy") else name + ".sy"
+        candidates = []
+        base = getattr(self, "base_dir", None)
+        if base:
+            candidates.append(os.path.join(base, path))
+        candidates.append(path)
+        candidates.append(os.path.join(os.getcwd(), path))
+        if os.path.isabs(path):
+            candidates.insert(0, path)
+        return next((c for c in candidates if os.path.isfile(c)), None)
     """标准库集合。由解释器实例化并注入运行上下文。"""
 
     def __init__(self, argv: list[str] | None = None,

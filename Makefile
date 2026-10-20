@@ -13,12 +13,12 @@ PY ?= python
 帮助:
 	@echo "枢言（Shuyan）常用任务"
 	@echo ""
-	@echo "  make 测试        运行内置自测（55 项，必须全绿）"
+	@echo "  make 测试        运行内置自测（59 项，必须全绿）"
 	@echo "  make 单元测试    运行 tests/ 下的标准化单元测试"
 	@echo "  make 示例        运行 examples/ 下全部示例程序"
 	@echo "  make 工程        运行 projects/ 下样例工程的主程序"
 	@echo "  make 应用自测    端到端自测 Web 应用（21 项，真实 HTTP 请求）"
-	@echo "  make 探针        运行压测探针与企业场景探针"
+	@echo "  make 探针        运行压测探针、企业场景探针与极端形态探针"
 	@echo "  make 检查        静态检查 examples/ 与 projects/（必须零问题）"
 	@echo "  make 文档        从源码重新生成 docs/STDLIB.md"
 	@echo "  make 基准        运行性能基准套件"
@@ -44,6 +44,7 @@ PY ?= python
 工程:
 	$(PY) sy.py 运行 projects/库存管理/主程序.sy
 	$(PY) sy.py 运行 projects/应收对账/主程序.sy
+	$(PY) sy.py 运行 projects/ERP/主程序.sy
 
 应用自测:
 	$(PY) projects/留言板/自测.py
@@ -51,6 +52,7 @@ PY ?= python
 探针:
 	$(PY) tools/probe_stress.py
 	$(PY) tools/probe_enterprise.py
+	$(PY) tools/probe_extreme.py
 
 检查:
 	$(PY) sy.py 检查 examples/*.sy projects/*/*.sy

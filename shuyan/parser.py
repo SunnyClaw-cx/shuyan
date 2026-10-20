@@ -19,12 +19,32 @@ from .ast_nodes import (
 )
 from .diagnostics import (
     Diagnostic, E_COMPARE_CHAIN, E_DISCARDED_EXPR, E_EXPECTED_EXPRESSION,
-    E_EXPECTED_TOKEN,
+    E_EXPECTED_TOKEN, E_TOO_DEEP,
     E_NO_MEMBER, E_NO_OVERLOAD, E_REDEFINED, E_STRAY_END, E_UNCLOSED_BLOCK,
     E_UNEXPECTED_TOKEN, ParseError, Severity,
 )
 from .lexer import Kind, Lexer, Token
 from .source import Span
+
+# 受支持的嵌套深度上限（表达式 / 语句块共用）。
+#
+# 取值 180 —— **实测得到，不是拍脑袋**（`tools/probe_extreme.py` 可复现）：
+#
+#   在 Python 默认递归上限 1000 下，实测「解析 + 语义」全链路撞爆宿主栈
+#   的层数约：
+#       括号 `((((...))))`      约 320 层   ≈ 3.1 Python 帧/层
+#       列表 `[[[[...]]]]`      约 240 层   ≈ 4.2 Python 帧/层
+#       `如果` 块嵌套           约 240 层   ≈ 4.2 Python 帧/层
+#
+#   本守卫对**所有形态取同一个上限**，故须按**最紧的那个**（240）留余量：
+#   180 / 240 = 75%，即最坏形态下也留出 25% 的栈余量。
+#   手写代码的嵌套深度几乎不会超过 10 层，180 已极其宽松。
+#
+# 另有一道**兜底**（`cli._report_too_deep` / `linter._too_deep_diag`）：
+# 万一仍有未被覆盖的形态漏网并抛 RecursionError，也要转成枢言诊断。
+# 两道并存的原因是：递归深度预算是**结构相关**的，单靠一个常数无法
+# 覆盖所有语法形态；守卫负责「给出好建议」，兜底负责「绝不崩宿主」。
+MAX_NEST_DEPTH = 180
 
 # 中文运算符词在词法层已转为符号，此处仅需符号优先级表
 BINARY_BP: dict[str, tuple[int, int]] = {
@@ -91,6 +111,12 @@ class Parser:
         self._func_depth = 0
         self._error_count = 0        # 恐慌模式恢复用（见 _sync_to_next_line）
         self._stmt_mark = 0          # 进入当前语句时的错误计数
+        # 嵌套深度计数（表达式 / 语句块共用一个上限）。
+        # `_nest_reported` 保证**只报一次**：深层嵌套会触发成百上千次
+        # 超限检查，若每次都报，用户会被同一根因的重复报错淹没
+        # （违反 §8.5「一行错只报一条」的精神）。
+        self._nest_depth = 0
+        self._nest_reported = False
         # 同一根因已报错 ⇒ 抑制随之而来的「衍生」报错（如缺操作数之后的
         # 「括号未闭合」）。每条语句开始时重置。
         self._suppress_followup = False
@@ -959,12 +985,30 @@ class Parser:
 
     def _parse_block(self, stop: set[str]) -> list[Node]:
         """解析一个块体：支持 `{ }`、`结束` 结尾、或缩进式（v0.1 按语句序列处理）。"""
-        if self._check("{"):
-            blk = self._parse_brace_block()
-            return blk.body
-        # 允许 `则` 后的同一行语句
-        self._skip_terminators()
-        return self._parse_statements(stop_values=stop | {"end"})
+        # **语句块嵌套也要守卫**：`如果 ... 如果 ... 如果 ...` 每层都会
+        # 递归调用 `_parse_statements`，1000 层同样会撞爆 Python 栈
+        # （实测宿主 RecursionError）。与表达式共用同一个上限与同一个
+        # 「只报一次」标记。
+        self._nest_depth += 1
+        try:
+            if self._nest_depth > MAX_NEST_DEPTH:
+                if not self._nest_reported:
+                    self._nest_reported = True
+                    self._error(E_TOO_DEEP,
+                                f"语句块嵌套太深（超过 {MAX_NEST_DEPTH} 层），"
+                                f"已停止解析以免栈溢出。",
+                                self._cur().span,
+                                ["把内层逻辑抽成一个函数再调用",
+                                 "深层嵌套通常可以用循环改写"])
+                return []
+            if self._check("{"):
+                blk = self._parse_brace_block()
+                return blk.body
+            # 允许 `则` 后的同一行语句
+            self._skip_terminators()
+            return self._parse_statements(stop_values=stop | {"end"})
+        finally:
+            self._nest_depth -= 1
 
     def _expect_end(self, owner: str, start_span: Span) -> None:
         if self._check("end"):
@@ -986,6 +1030,37 @@ class Parser:
     # ------------------------------------------------------------ 表达式
 
     def _parse_expression(self, min_bp: int = 0) -> Node:
+        # **嵌套深度守卫**（唯一入口，故一处覆盖所有嵌套路径）。
+        #
+        # 递归下降解析器每进入一层嵌套就多一层 Python 调用栈。实测：
+        #   · 1000 层括号 `((((...1...))))`  ⇒ 宿主 RecursionError
+        #   · 500 层列表 `[[[[...1...]]]]`   ⇒ 宿主 RecursionError
+        #   · 1000 层 `如果` 嵌套              ⇒ 宿主 RecursionError
+        # 用户看到的是一段 **Python 堆栈**，而不是枢言诊断 —— 这是
+        # 「宿主崩溃」，比普通报错严重得多（工具链崩了，用户无从下手）。
+        #
+        # 阈值取 300：远低于 Python 默认递归上限（1000），留足余量给
+        # 解析器自身的调用层次；同时远高于正常人会写的嵌套深度
+        # （手写代码几乎不会超过 10 层）。超限即报**可行动**的诊断，
+        # 而不是硬撑到栈溢出。
+        self._nest_depth += 1
+        try:
+            if self._nest_depth > MAX_NEST_DEPTH:
+                if not self._nest_reported:
+                    self._nest_reported = True
+                    self._error(E_TOO_DEEP,
+                                f"表达式嵌套太深（超过 {MAX_NEST_DEPTH} 层），"
+                                f"已停止解析以免栈溢出。",
+                                self._cur().span,
+                                ["把表达式拆成多个中间变量（`定义 甲 = ...`）",
+                                 "深层嵌套通常可以用循环或递归函数改写"])
+                return Literal(span=self._cur().span, value=None,
+                               literal_kind="nil")
+            return self._parse_expression_inner(min_bp)
+        finally:
+            self._nest_depth -= 1
+
+    def _parse_expression_inner(self, min_bp: int = 0) -> Node:
         left = self._parse_prefix()
         if left is None:
             return Literal(span=self._cur().span, value=None, literal_kind="nil")

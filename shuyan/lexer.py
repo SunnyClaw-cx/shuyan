@@ -546,12 +546,20 @@ class Lexer:
                 break
         word = "".join(buf)
 
-        # 拉丁段以 `_` 结尾且紧跟汉字 ⇒ 混合标识符，汉字段整体并入
-        if word.endswith("_") and is_han(self._peek()):
+        # 拉丁段以 `_` 结尾且紧跟汉字 ⇒ 混合标识符，汉字段整体并入。
+        #
+        # **必须循环**：混合标识符可以有多段（`A1_账_余额`）。
+        # 早期只吸收**一轮**（`_latin_word` 里吸一次汉字段 + 一次拉丁段），
+        # 于是 `A1_账_余额` 被切成 `A1_账_` + `余额` —— 第二段汉字段
+        # 又走了 `_han_block`，报出「`余额` 两侧没有运算符」这种
+        # 与真因毫不相干的错误。判据统一为：**只要 `_` 后面还跟着
+        # 字母/数字/汉字，就并进同一个标识符**，直到遇到真正的分隔符。
+        while word.endswith("_") and (is_han(self._peek())
+                                      or self._peek().isascii()
+                                      and self._peek().isalnum()):
             while is_han(self._peek()):
                 word += self._peek()
                 self._advance()
-            # 继续续接数字/下划线
             while True:
                 ch = self._peek()
                 if ch.isascii() and (ch.isalnum() or ch == "_"):
@@ -624,6 +632,27 @@ class Lexer:
                     self._advance()
                 else:
                     break
+            # **尾段里出现 `_` ⇒ 这是一个混合标识符**，其后的汉字必须
+            # 继续整体并入（不再切关键字）。
+            #
+            # 实测真缺陷：`账簿006_借方合计` 曾被切成 `账簿006_` + `借方合计`
+            # 两枚记号。原因是本循环只吸收「ascii 字母数字与下划线」，
+            # 遇到汉字即停 —— 而下划线出现在**数字之后**，使它没能走进
+            # 上面那条 `sep_from_stream`（那条只认「汉字块紧跟 `_`」）。
+            # 后果不是报「标识符未定义」，而是报
+            # 「`贷方合计` 两侧没有运算符」—— 把用户引向完全不相关的地方。
+            # 真实工程里 `服务001_校验`、`账簿006_借方合计` 这类命名极常见，
+            # 故危害面很大。此处的判据与 `_latin_word`（拉丁段以 `_` 结尾
+            # 则并入汉字段）**同口径**：只要 `_` 出现过，就是整体标识符。
+            if tail2 and "_" in "".join(tail2):
+                while True:
+                    ch = self.raw[self.pos] if self.pos < len(self.raw) else "\0"
+                    if is_han(ch) or (ch.isascii()
+                                      and (ch.isalnum() or ch == "_")):
+                        tail2.append(self.norm[self.pos])
+                        self._advance()
+                    else:
+                        break
             if tail2:
                 pieces[-1] = (Kind.IDENT, pieces[-1][1] + "".join(tail2))
 

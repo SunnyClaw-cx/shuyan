@@ -115,6 +115,10 @@ class Interpreter:
         self.steps = 0
         self.max_steps = 200_000_000        # 兜底：防死循环卡死
         self._module_cache: dict[str, ShuyanMap] = {}
+        # 正在加载的本机模块（防循环引入无限递归）—— **与语义层同口径**。
+        # 用 set 判重（按 realpath），用 list 记引入链用于报错展示。
+        self._loading_modules: set[str] = set()
+        self._loading_names: list[str] = []
         self._install_builtins()
 
     def _install_builtins(self) -> None:
@@ -447,24 +451,38 @@ class Interpreter:
         self._load_module_file(node)
 
     def _load_module_file(self, node: Use) -> None:
-        path = node.module
-        if not path.endswith(".sy"):
-            path += ".sy"
-        # 与语义层 `_import_module_file` **同口径**的候选路径：
-        # 先把模块名解析成文件名，再把文件名解析成路径，两处一套规则。
-        candidates = []
-        base = getattr(self.stdlib, "base_dir", None)
-        if base:
-            candidates.append(os.path.join(base, path))
-        candidates.append(path)
-        candidates.append(os.path.join(os.getcwd(), path))
-        if os.path.isabs(path):
-            candidates.insert(0, path)
-        full = next((c for c in candidates if os.path.isfile(c)), None)
+        # 模块路径解析走**唯一入口** `StdLib.resolve_module_file` ——
+        # 与语义分析器共用同一份候选路径实现（SPEC §3.8.1 第 2 条：
+        # 编译期与运行期必须同口径）。两处各写一份必然分叉。
+        full = self.stdlib.resolve_module_file(node.module)
         if full is None:
             raise error("引入错误",
                         f"找不到模块「{node.module}」"
                         f"（既不是内置模块，也不是已存在的 .sy 文件）。")
+        # **循环引入守卫 —— 与语义层同口径**（`semantic._import_module_file`）。
+        #
+        # 运行期曾经**完全没有这一道**：甲引入乙、乙又引入甲时，子解释器
+        # 层层展开，直到撞上「递归太深」（D4002）—— 报出的错误与真因
+        # 毫无关系，用户完全不知道是引入关系写错了。
+        # 这正是「同一语义两处实现必然分叉」的又一例：语义层有守卫、
+        # 运行期没有，于是编译期放行、运行期崩。
+        real = os.path.realpath(full)
+        if real in self._loading_modules:
+            raise error("引入错误",
+                        f"模块循环引入：「{node.module}」在引入链上又回到了自己"
+                        f"（{' → '.join(self._loading_names + [node.module])}）。",
+                        提示="把两个模块都要用的部分抽成第三个模块，"
+                              "两边各自引入它；或把互相调用的逻辑合并到一个模块")
+        self._loading_modules.add(real)
+        self._loading_names.append(node.module)
+        try:
+            self._load_module_file_inner(node, full)
+        finally:
+            self._loading_modules.discard(real)
+            if self._loading_names and self._loading_names[-1] == node.module:
+                self._loading_names.pop()
+
+    def _load_module_file_inner(self, node: Use, full: str) -> None:
         from .lexer import Lexer
         from .parser import Parser
         from .semantic import Analyzer
@@ -483,6 +501,10 @@ class Interpreter:
         sub.global_env = Env()
         sub.env = sub.global_env          # env 必须跟着走，否则语句写进旧环境
         sub._install_builtins()
+        # **引入链必须传给子解释器**：否则 A→B→C→A 这种跨三层的循环
+        # 在运行期仍然会退化成「递归太深」（每一层子解释器的链都是空的）。
+        sub._loading_modules = self._loading_modules
+        sub._loading_names = self._loading_names
         # 记录「标准库基线」——模块自己定义的名字才对外导出，
         # 否则模块会连带把 `输出`、`数学` 等一堆内置名一并暴露出去。
         baseline = set(sub.global_env.vars)
@@ -498,6 +520,17 @@ class Interpreter:
         }
         modname = os.path.splitext(os.path.basename(node.module))[0]
         if node.names:
+            # **按名引入类型**（`引入 { 点 } 从 "模块"`）：类型对象须显式
+            # 回填到导出集，否则语义层说「可以裸用 `点(...)`」、运行期
+            # 却报「没有定义 点」—— 又是编译期与运行期分叉。
+            # 注意：`node.names` 在**整模块引入**时为 None，故必须包在
+            # 这个 `if` 里（曾因写成平级循环而 `TypeError: NoneType` 崩）。
+            for tn in node.names:
+                if isinstance(exports.get(tn), ShuyanType):
+                    continue
+                sub_type = self._lookup_sub_type(sub, tn)
+                if sub_type is not None:
+                    exports[tn] = sub_type
             for n in node.names:
                 if n in exports:
                     self.env.vars[n] = exports[n]
@@ -509,13 +542,51 @@ class Interpreter:
             self.env.vars[modname] = ns
             self._module_cache[modname] = ns
 
+    def _lookup_sub_type(self, sub, name: str):
+        """在子解释器里找某个**类型对象**（按名引入类型时用）。
+
+        查找范围限定在子解释器的全局环境，且必须确实是 `ShuyanType` ——
+        否则会把同名的普通值也当成类型绑出去，那就成了「按名引入把变量
+        也一并带过来」的静默错误。
+        """
+        v = sub.global_env.vars.get(name)
+        return v if isinstance(v, ShuyanType) else None
+
     def _exec_TypeDecl(self, node: TypeDecl) -> None:
         # 结构体与枚举在运行期登记为**类型对象**，使
         # `点(横 是 3, 纵 是 4)` 与 `星期.三` 有可求值的目标。
         # 别名不产生值（它只是编译期的重命名）。
+        #
+        # 成员的名称信息**取自本解释器的 analyzer**（它分析的就是这份源码），
+        # 因此对**模块文件**而言，拿到的是该模块自己的成员表 —— 这正是
+        # `模块.枚举.成员` 能工作的前提。挂到类型对象上后，它随命名空间
+        # 一起传到引入方，无需再回查顶层分析器。
         if node.kind == "struct" or node.kind == "enum":
+            members: tuple[str, ...] = ()
+            fields: tuple[str, ...] = ()
+            if self.analyzer is not None:
+                if node.kind == "enum":
+                    et = self.analyzer.enum_types.get(node.name)
+                    if et is not None:
+                        members = tuple(et.member_names)
+                else:
+                    st = self.analyzer.struct_types.get(node.name)
+                    if st is not None:
+                        fields = tuple(st.field_names)
+            if not members and node.kind == "enum":
+                # 兜底：即便分析器没登记（例如子模块只做了即时分析），
+                # 也从 AST 直接取成员名 —— 枚举成员名一律取**源码原文**。
+                for m in getattr(node, "members", []) or []:
+                    if isinstance(m, tuple):
+                        members += (m[0],)
+                    else:
+                        members += (getattr(m, "name_text", None) or m.name,)
+            if not fields and node.kind == "struct":
+                for f in getattr(node, "fields", []) or []:
+                    fields += (f[0],)
             self.env.vars[node.name] = ShuyanType(
-                name=node.name, kind=node.kind)
+                name=node.name, kind=node.kind,
+                members=members, fields=fields)
 
     def _lookup_type(self, name: str):
         """按名找类型对象（结构体 / 枚举），遵守**遮蔽**语义。
@@ -878,7 +949,7 @@ class Interpreter:
                             f"请先取到成员再访问，"
                             f"例如 `{t.name}.某成员.序号`。",
                             枚举=t.name)
-            members = self._enum_members(t.name)
+            members = self._enum_members(t.name, t)
             if key in members:
                 return EnumMember(enum_name=t.name, member_name=key,
                                   ordinal=members.index(key) + 1)
@@ -905,12 +976,21 @@ class Interpreter:
                     f"可用属性：序号、名称。",
                     枚举=m.enum_name, 属性=key)
 
-    def _enum_members(self, tname: str) -> list[str]:
+    def _enum_members(self, tname: str, t: ShuyanType | None = None) -> list[str]:
         """取枚举的成员名序列（按源码原文）。
 
-        优先取自语义分析器的注册表（编译期已解析），
-        因此解释器与语义层共用**同一份**成员表 —— 两处各存一份必然分叉。
+        取值优先级体现了**修正过的一处根因**：
+          ① 类型对象**自带**的 `members`（最可靠）；
+          ② 本解释器 analyzer 的注册表。
+
+        早期只有 ②，且 `self.analyzer` 是**顶层**分析器，于是
+        `引入 "模块"` 之后写 `模块.颜色.红` 会取到空成员表 ——
+        报出「枚举「颜色」没有成员「红」。可用成员：」（列表还是空的），
+        用户既看不到正确成员名，也不知道为什么。类型是可飞行的值，
+        成员表必须跟着它走，不能靠回查某个特定的分析器。
         """
+        if t is not None and t.members:
+            return list(t.members)
         if self.analyzer is not None:
             et = self.analyzer.enum_types.get(tname)
             if et is not None:
@@ -1005,7 +1085,17 @@ class Interpreter:
         st = None
         if self.analyzer is not None:
             st = self.analyzer.struct_types.get(t.name)
-        order = st.field_names if st is not None else list(node.kwargs)
+        # 字段顺序优先取**类型对象自带**的 `fields`（随命名空间飞行），
+        # 再退到本解释器 analyzer。理由同 `_enum_members`：
+        # 顶层 analyzer 不登记被引入模块的类型，回查会得到空顺序，
+        # 于是 `模块.点(纵 是 4, 横 是 3)` 的打印顺序不稳定。
+        if t.fields:
+            order = list(t.fields)
+        elif st is not None:
+            order = st.field_names
+        else:
+            order = list(node.kwargs)
+        has_schema = bool(t.fields) or st is not None
 
         if node.args:
             raise error("构造错误",
@@ -1022,14 +1112,14 @@ class Interpreter:
                 fields[name] = self._eval(node.kwargs[name])
         for name, expr in node.kwargs.items():
             if name not in fields:
-                if st is not None and name not in order:
+                if has_schema and name not in order:
                     raise error("构造错误",
                                 f"结构体「{t.name}」没有字段「{name}」。"
                                 f"可用字段：{'、'.join(order)}。",
                                 类型=t.name, 字段=name)
                 fields[name] = self._eval(expr)
 
-        if st is not None:
+        if has_schema:
             missing = [f for f in order if f not in fields]
             if missing:
                 raise error("构造错误",

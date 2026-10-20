@@ -92,15 +92,58 @@ def _prepare_console() -> None:
 
 
 def _compile(source: str, path: str, stdlib: StdLib):
-    """词法 → 语法 → 语义。抛出的异常由调用方渲染。"""
+    """词法 → 语法 → 语义。抛出的异常由调用方渲染。
+
+    语义分析器带上文件名与源码行：被引入模块的诊断会**回流**到同一个
+    诊断列表（见 `semantic._import_module_file_inner`），必须能区分
+    「这条错误来自哪个文件」。
+    """
     tokens = Lexer(source, path).tokenize()
     program = Parser(tokens, path).parse()
-    analyzer = Analyzer(stdlib)
+    analyzer = Analyzer(stdlib, filename=path,
+                        source_lines=source.splitlines())
     types, diags = analyzer.analyze(program)
     errors = [d for d in diags if d.severity is Severity.ERROR]
     if errors:
         raise SemanticError(diags)
     return program, analyzer, diags
+
+
+def _too_deep_diag(source: str):
+    """漏网的 RecursionError → 枢言诊断（与 `linter._too_deep_diag` 同口径）。"""
+    from .diagnostics import Diagnostic, E_TOO_DEEP
+    from .source import Span
+    return Diagnostic(
+        E_TOO_DEEP,
+        "源码嵌套太深，已超出本实现可安全解析的深度。",
+        Span(1, 1, 1, 1), Severity.ERROR,
+        ["把深层嵌套拆成多个中间变量或函数",
+         "括号 / 列表 / 语句块的嵌套层数越少越好",
+         f"（本文件共 {len(source.splitlines())} 行）"],
+    )
+
+
+def _report_too_deep(source: str, path: str) -> int:
+    """渲染「嵌套太深」诊断并返回失败码。"""
+    from .diagnostics import render as _render
+    diag = _too_deep_diag(source)
+    print(_render(diag, source.splitlines()), file=sys.stderr)
+    print("共 1 个错误", file=sys.stderr)
+    return 1
+
+
+def _render_with_files(diags, main_path: str, main_source: str) -> str:
+    """渲染诊断，并把各文件源码喂给渲染器（跨文件定位用）。"""
+    line_map: dict[str, list[str]] = {}
+    for d in diags:
+        if d.file and d.file not in line_map:
+            try:
+                with open(d.file, "r", encoding="utf-8") as f:
+                    line_map[d.file] = f.read().splitlines()
+            except OSError:
+                pass
+    return render_all(diags, main_source, main_file=main_path,
+                      source_line_map=line_map)
 
 
 def cmd_run(args: list[str]) -> int:
@@ -143,8 +186,13 @@ def _run_one(path: str, extra: list[str]) -> int:
     try:
         program, analyzer, diags = _compile(source, path, stdlib)
     except (LexError, ParseError, SemanticError) as exc:
-        print(render_all(exc.diagnostics, source), file=sys.stderr)
+        print(_render_with_files(exc.diagnostics, path, source),
+              file=sys.stderr)
         return 1
+    except RecursionError:
+        # 兜底：编译阶段漏网的递归溢出转成枢言诊断，绝不把 Python
+        # 堆栈甩给用户（详见 `_too_deep_diag` 的说明）。
+        return _report_too_deep(source, path)
 
     # 运行期错误与警告分开渲染：警告是提醒，不是故障。
     # 混在同一段「运行时错误」里会让人误以为程序跑不动了。
@@ -175,7 +223,7 @@ def cmd_check(args: list[str]) -> int:
         if not diags:
             print(f"✓ {path}：没有发现问题。")
             continue
-        print(render_all(diags, source))
+        print(_render_with_files(diags, path, source))
         errors = [d for d in diags if d.severity is Severity.ERROR]
         if errors:
             worst = 1

@@ -80,6 +80,10 @@ projects/**/*.csv
 # 临时调试脚本（开发时随手写的 .sy 片段，不属项目内容）
 .tmp_*
 /tmp_*
+# 规模压测的临时工程（由 tools/gen_big_project.py 生成，可随时重建）
+.tmpbig/
+.tmpprobe/
+.tmpbig_*.log
 
 # ---- 本地私有内容（不入库） ----
 *.local.md

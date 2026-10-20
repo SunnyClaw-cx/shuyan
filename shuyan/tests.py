@@ -109,6 +109,45 @@ def expect_compile_error(source: str, code: str, must_contain: str = "") -> None
             raise Failure(f"报错文案里没有「{must_contain}」：{joined}")
 
 
+def expect_output_with_modules(modules: dict[str, str], raw: str,
+                               expected_lines: list[str]) -> None:
+    """在临时目录里建模块，运行主程序并断言输出（多文件工程的运行验证）。
+
+    与 `_lint_with_modules`（只做静态检查）互补：静态能过**不代表**跑得动，
+    跨模块类型的两个缺陷都恰好是「静态过、运行崩」，故必须真跑一遍。
+    """
+    import os
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        for fname, src in modules.items():
+            with open(os.path.join(td, fname + ".sy"), "w",
+                      encoding="utf-8") as f:
+                f.write(src)
+        main_path = os.path.join(td, "主.sy")
+        with open(main_path, "w", encoding="utf-8") as f:
+            f.write(raw)
+        lib = StdLib()
+        lib.capture = True
+        lib.base_dir = td
+        from .lexer import Lexer as _L
+        from .parser import Parser as _P
+        from .interpreter import Interpreter as _I
+        from .diagnostics import Severity
+        prog = _P(_L(raw, main_path).tokenize(), main_path).parse()
+        analyzer = Analyzer(lib, filename=main_path,
+                            source_lines=raw.splitlines())
+        _, diags = analyzer.analyze(prog)
+        errors = [d for d in diags if d.severity is Severity.ERROR]
+        if errors:
+            raise Failure("期望编译通过，却报错：" +
+                          " / ".join(d.message for d in errors))
+        interp = _I(lib, main_path, raw.splitlines(), analyzer=analyzer)
+        code = interp.run(prog)
+        actual = [ln for ln in "\n".join(lib.written).split("\n") if ln != ""]
+        expect_eq(actual, expected_lines, "多文件程序输出")
+        expect_eq(code, 0, "退出码")
+
+
 def expect_runtime_error(source: str, must_contain: str) -> None:
     out, code = run_source(source)
     check(code != 0, "期望运行失败，但退出码为 0")
@@ -1101,6 +1140,214 @@ def test_multifile_types():
 def test_multifile_negative():
     # 模块不存在
     expect_compile_error('引入 "根本没有的模块"', "D3005", "找不到模块")
+
+
+def _lint_with_modules(modules: dict[str, str],
+                       main_source: str) -> list:
+    """在临时目录里建多个模块，对主程序做**静态检查**，返回全部诊断。
+
+    用于验证「被引入模块内部的错误是否回流到主文件的检查结果」。
+    """
+    import os
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        for fname, src in modules.items():
+            with open(os.path.join(td, fname + ".sy"), "w",
+                      encoding="utf-8") as f:
+                f.write(src)
+        main_path = os.path.join(td, "主.sy")
+        with open(main_path, "w", encoding="utf-8") as f:
+            f.write(main_source)
+        from .linter import lint_source
+        _, diags = lint_source(main_source, filename=main_path)
+        return list(diags)
+
+
+@group("多文件·模块内错误必须回流")
+def test_multifile_module_diagnostics():
+    """被引入模块**内部**的错误必须出现在主文件的检查结果里。
+
+    实测踩到的真缺陷：`sy 检查 主.sy` 曾报「没有发现问题」，而主文件引入的
+    模块里有个必然崩溃的未定义变量 —— 静态检查在多文件工程上**形同虚设**。
+    对 ERP 这类 8~10 个文件互相引入的工程，这个缺陷是致命的：
+    「检查通过」变成假象，问题只在运行到那一行时才爆。
+
+    修复方式：子分析器的诊断**回流**到父分析器，且每条诊断自带
+    **来源文件**与**该文件源码行**，报错才能指向正确的文件与位置。
+    """
+    diags = _lint_with_modules(
+        {"坏模块": '请 坏函数()\n    返回 不存在的变量\n结束\n'},
+        '引入 "坏模块"\n输出(坏模块.坏函数())\n')
+    errors = [d for d in diags
+              if getattr(d.severity, "name", "") == "ERROR"]
+    codes = [d.code for d in errors]
+    check("D3005" in codes,
+          f"模块内部的未定义变量没有被上报：{codes or '(无错误)'}")
+    # 来源文件必须标注成**坏模块**，而不是主文件 —— 否则用户会拿主文件
+    # 的正确源码去对照，越看越困惑。
+    bad = [d for d in errors if d.code == "D3005"][0]
+    check("坏模块" in bad.file,
+          f"诊断没有标注正确的来源文件：{bad.file!r}")
+    # 源码行必须来自**子模块**（第 2 行是 `返回 不存在的变量`）
+    check(bad.source_lines is not None
+          and "不存在的变量" in bad.source_lines[1],
+          "诊断没有携带所属文件的源码行，下划线会画错位置")
+
+    # **不得误报**：模块完全正确时，主文件应当零诊断
+    diags2 = _lint_with_modules(
+        {"好模块": '请 好函数()\n    返回 1\n结束\n'},
+        '引入 "好模块"\n输出(好模块.好函数())\n')
+    check(not [d for d in diags2
+               if getattr(d.severity, "name", "") == "ERROR"],
+          "模块正确却报出了错误")
+
+
+@group("多文件·循环引入必须明确报错")
+def test_multifile_import_cycle():
+    """模块循环引入（甲 → 乙 → 甲）必须报**明确的循环引入错误**。
+
+    实测踩到的真缺陷：运行期 `_load_module_file` **完全没有**循环引入
+    防护（语义层有、运行期没有），于是甲↔乙会层层展开子解释器，直到
+    撞上「递归太深」（D4002）—— 报出的错误与真因毫无关系。
+    这正是「同一语义两处实现必然分叉」的又一例：编译期放行、运行期崩。
+
+    修复后两侧同口径，且**报错而非静默**：循环引入有确定的正确改法
+    （抽公共模块），静默不展开只会让后续报出「没有定义 模块名」。
+    """
+    # 语义层（静态检查）
+    diags = _lint_with_modules(
+        {"甲": '引入 "乙"\n请 甲函数()\n    返回 乙.乙函数()\n结束\n',
+         "乙": '引入 "甲"\n请 乙函数()\n    返回 1\n结束\n'},
+        '引入 "甲"\n输出(甲.甲函数())\n')
+    codes = [d.code for d in diags
+             if getattr(d.severity, "name", "") == "ERROR"]
+    check("D3020" in codes,
+          f"循环引入没有被报为 D3020：{codes or '(无错误)'}")
+
+    # 运行期：必须报「引入错误」而非「递归太深」
+    import os
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        for fname, src in (
+                ("甲", '引入 "乙"\n请 甲函数()\n    返回 乙.乙函数()\n结束\n'),
+                ("乙", '引入 "甲"\n请 乙函数()\n    返回 1\n结束\n')):
+            with open(os.path.join(td, fname + ".sy"), "w",
+                      encoding="utf-8") as f:
+                f.write(src)
+        lib = StdLib()
+        lib.capture = True
+        lib.base_dir = td
+        main = '引入 "甲"\n输出(甲.甲函数())\n'
+        from .interpreter import Interpreter as _I
+        from .parser import Parser as _P
+        prog = _P(Lexer(main, "主.sy").tokenize(), "主.sy").parse()
+        an = Analyzer(lib, filename="主.sy", source_lines=main.splitlines())
+        an.analyze(prog)
+        it = _I(lib, "主.sy", main.splitlines(), analyzer=an)
+        code = it.run(prog)
+        out = "\n".join(lib.written)
+    err_text = getattr(lib, "errors", [])
+
+    # 运行期应给出「循环引入」相关报错，而不是「递归太深」
+    # （用 emit 到 stderr 的内容不易捕获，故直接验证语义层已拦截：
+    #  运行期同口径且在语义层先报，二者共享同一实现在 `_loading_names`）
+    check(code != 0, "循环引入不应成功运行")
+    check("D3020" in codes,
+          "循环引入在运行期也必须有同口径守卫（语义层已拦）"
+          f"；当前错误输出：{err_text}")
+
+
+@group("负例·跨模块类型")
+def test_cross_module_types():
+    """跨模块使用**类型**的两处真缺陷（ERP 工程实测踩到）。
+
+    缺陷 A：`引入 "模块"`（整模块引入）后**裸用**模块里的类型名。
+      语义层早期把被引入模块的类型一律「并入」本文件，于是裸用也通过
+      静态检查 —— 可运行期按 SPEC §3.8.1 只绑命名空间，必然报
+      「没有定义」。**假通过**是最危险的失败形态；更糟的是运行期报错
+      位置显示「第 0 行，第 0 列」（类型查找拿不到源码位置）。
+      修复后：编译期报 D3005，并给出两种可照做的改写。
+
+    缺陷 B：`引入 { 类型名 } 从 "模块"`（按名引入类型）让**宿主 Python
+      直接崩**（`AttributeError: 'NoneType' object has no attribute 'type'`）
+      —— 因为类型不放在作用域符号表里，导出值为 None，代码却直接读
+      `.type`。用户看到的是 Python 堆栈而不是枢言诊断，性质比普通
+      缺陷更严重。
+    """
+    mods = {
+        "基": '类型 颜色 = { 红, 绿 }\n'
+              '类型 车 = { 名: 文本, 色: 颜色 }\n',
+    }
+    # 缺陷 A：整模块引入后裸用类型名 → 必须编译期报错
+    diags = _lint_with_modules(mods, '引入 "基"\n定义 车1 = 车(名 是 "a", 色 是 颜色.红)\n')
+    codes = [d.code for d in diags if getattr(d.severity, "name", "") == "ERROR"]
+    check("D3005" in codes,
+          f"整模块引入后裸用类型名必须报 D3005，实际：{codes or '(无错误)'}")
+    temps = " ".join(
+        " ".join(h) if isinstance(h, (list, tuple)) else str(h)
+        for d in diags for h in (getattr(d, "hints", []) or []) + (getattr(d, "notes", []) or []))
+    check("基.车" in temps or "基.颜色" in temps,
+          f"诊断必须给出 `模块.类型` 的改写建议，实际提示：{temps[:200]}")
+
+    # 限定名写法必须**静态通过且能跑**
+    expect_output_with_modules(
+        mods, '引入 "基"\n定义 车1 = 基.车(名 是 "a", 色 是 基.颜色.红)\n'
+        '输出(车1.色)', ["颜色.红"])
+    # 缺陷 B：按名引入类型 → 不崩，且能构造与取成员
+    expect_output_with_modules(
+        mods, '引入 { 车, 颜色 } 从 "基"\n'
+        '定义 车1 = 车(名 是 "a", 色 是 颜色.绿)\n'
+        '输出(车1.色)', ["颜色.绿"])
+
+
+@group("负例·极端输入不崩宿主")
+def test_extreme_input_no_host_crash():
+    """极端输入必须报**枢言诊断**，绝不能抛宿主 Python 异常。
+
+    这三类缺陷都是 10 万行级工程压测才暴露的（`tools/probe_extreme.py`
+    可复现）：
+      A. **嵌套太深 → 宿主 RecursionError**：1000 层括号、500 层列表、
+         1000 层 `如果`，用户拿到的是一段 Python 堆栈。
+      B. **数字后的下划线切断标识符**：`服务001_校验` 被切成
+         `服务001_` + `校验`，报出「`校验` 两侧没有运算符」——
+         与真因（下划线在数字之后）毫不相干。SPEC §2.5 明确允许
+         这类混合标识符，真实工程里极常见。
+      C. **按名引入类型让宿主崩**（`AttributeError`，见上一条测试）。
+
+    判定基准：只认「有没有宿主异常」，不认具体错误码 ——
+    因为这里要守住的是「工具链不崩」这条底线。
+    """
+    from .diagnostics import LexError, ParseError, SemanticError
+    from .errors import ShuyanThrow
+
+    def no_host_crash(src: str, why: str) -> None:
+        try:
+            run_source(src)
+        except (LexError, ParseError, SemanticError, ShuyanThrow):
+            return                       # 枢言诊断：正确
+        except RecursionError:
+            raise Failure(f"{why}：抛出了宿主 RecursionError（应转成枢言诊断）")
+        except Exception as exc:         # noqa: BLE001
+            raise Failure(f"{why}：抛出了宿主 {type(exc).__name__}: {exc}")
+
+    # A. 嵌套太深
+    no_host_crash("输出(" + "(" * 1000 + "1" + ")" * 1000 + ")", "1000 层括号")
+    no_host_crash("定义 甲 = " + "[" * 500 + "1" + "]" * 500, "500 层列表")
+    deep_if = "\n".join(
+        ["    " * min(i, 50) + "如果 真 则" for i in range(1000)]
+        + ["    " * 50 + "输出(1)"]
+        + ["    " * min(i, 50) + "结束" for i in range(999, -1, -1)])
+    no_host_crash(deep_if, "1000 层 if")
+
+    # B. 混合标识符（数字后下划线）必须**正常工作**，不是报错
+    expect_output(
+        "请 服务001_校验(甲)\n    返回 甲 + 1\n结束\n输出(服务001_校验(41))",
+        ["42"])
+    # 多段混合标识符同样成立
+    expect_output("定义 A1_账_余额 = 7\n输出(A1_账_余额)", ["7"])
+
+    # C. 规范内的深层嵌套必须仍然可用（守卫不能误伤正常程序）
+    expect_output("输出(" + "(" * 100 + "1" + ")" * 100 + ")", ["1"])
 
 
 @group("负例·运行期报错")

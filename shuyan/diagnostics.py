@@ -50,6 +50,14 @@ class Diagnostic:
     severity: Severity = Severity.ERROR
     hints: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # 诊断所属**源文件**。跨文件工程里必须带上 —— 否则「被引入模块内部
+    # 的错误」无法说明自己在哪个文件，用户会拿主文件的正确源码去对照，
+    # 越看越困惑。空字符串表示「当前文件」（单文件场景）。
+    file: str = ""
+    # 该诊断**自己所在文件**的源码行。让诊断自包含渲染所需的一切：
+    # 子模块的错误行号是相对子模块的，用主文件源码去画下划线会指错位置。
+    # 共享同一个 list 对象，内存开销可忽略。
+    source_lines: list[str] | None = None
 
     @property
     def category(self) -> str:
@@ -110,12 +118,21 @@ MAX_REPORTED = 50
 
 
 def render(diag: Diagnostic, source_lines: list[str],
-           show_hints: bool = True) -> str:
+           show_hints: bool = True, main_file: str = "") -> str:
     """把单条诊断渲染成中文报告块。
 
     source_lines 为源码按行切分的结果（0 起索引，即 source_lines[line-1]）。
+    **若诊断自带 source_lines，优先用它** —— 跨文件工程里，一条来自被引入
+    模块的诊断，行号是相对那个模块的；用主文件源码去画下划线会指错位置。
+    main_file 为当前被检查的主文件；诊断来自**别的文件**时才加文件名前缀，
+    单文件场景不加，避免噪音。
     """
-    head = (f"第 {diag.span.line} 行，第 {diag.span.col} 列："
+    if diag.source_lines is not None:
+        source_lines = diag.source_lines
+    loc = ""
+    if diag.file and main_file and diag.file != main_file:
+        loc = f"{diag.file} · "
+    head = (f"{loc}第 {diag.span.line} 行，第 {diag.span.col} 列："
             f"{diag.category}（{diag.code}）")
     lines = [f"{head}"]
     lines.append(f"  {diag.message}")
@@ -147,11 +164,24 @@ def render(diag: Diagnostic, source_lines: list[str],
     return "\n".join(lines)
 
 
-def render_all(diagnostics: list[Diagnostic], source_text: str) -> str:
-    """渲染全部诊断。超过上限时聚合汇总，避免刷屏。"""
+def render_all(diagnostics: list[Diagnostic], source_text: str,
+               main_file: str = "", source_line_map: dict | None = None) -> str:
+    """渲染全部诊断。超过上限时聚合汇总，避免刷屏。
+
+    main_file 用于判断「诊断是否来自别的文件」；source_line_map 可给出
+    {文件名: 行列表}，供不带 source_lines 的诊断按 file 取源码。
+    """
     source_lines = source_text.splitlines()
     shown = diagnostics[:MAX_REPORTED]
-    blocks = [render(d, source_lines) for d in shown]
+
+    def _lines_for(d: Diagnostic) -> list[str]:
+        if d.source_lines is not None:
+            return d.source_lines
+        if d.file and source_line_map and d.file in source_line_map:
+            return source_line_map[d.file]
+        return source_lines
+
+    blocks = [render(d, _lines_for(d), main_file=main_file) for d in shown]
 
     errors = sum(1 for d in diagnostics if d.severity is Severity.ERROR)
     warnings = sum(1 for d in diagnostics if d.severity is Severity.WARNING)
@@ -182,6 +212,10 @@ E_STRAY_END = "D2010"
 E_BAD_ASSIGN_TARGET = "D2011"
 # 表达式语句的值算完就丢，不产生任何效果（行首运算符续写会落到这里）
 E_DISCARDED_EXPR = "D2012"
+# 嵌套太深：递归下降解析器会撞爆宿主 Python 栈。必须在超限时**提前**
+# 报枢言诊断，而不是硬撑到 RecursionError —— 后者给用户的是一段
+# Python 堆栈，属于「宿主崩溃」，比普通报错严重得多。
+E_TOO_DEEP = "D2013"
 
 E_CONST_NO_INIT = "D3001"
 E_DEFAULT_PARAM_ORDER = "D3002"
@@ -202,6 +236,8 @@ E_RETURN_OUTSIDE_FN = "D3016"
 E_STRUCT_FIELD = "D3017"        # 构造字段不符：缺少 / 多余 / 未知 / 类型不符
 E_NO_FIELD = "D3018"            # 结构体字段不存在（读或写）
 E_NO_MEMBER = "D3019"           # 枚举成员不存在 / 类型定义非法
+E_IMPORT_CYCLE = "D3020"        # 模块循环引入（甲 → 乙 → 甲）
+E_IMPORT_SELF = "D3021"         # 模块引入自身
 
 W_SHADOW = "W4001"
 W_UNUSED = "W4002"

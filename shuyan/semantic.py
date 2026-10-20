@@ -27,7 +27,8 @@ from .ast_nodes import (
 from .builtins import StdLib
 from .diagnostics import (
     Diagnostic, E_ARG_COUNT, E_BAD_ASSIGN_TARGET, E_BAD_INDEX,
-    E_COMPARE_CHAIN, E_CONST_NO_INIT, E_DIVIDE_ZERO, E_LOOP_KEYWORD,
+    E_COMPARE_CHAIN, E_CONST_NO_INIT, E_DIVIDE_ZERO, E_IMPORT_CYCLE,
+    E_LOOP_KEYWORD,
     E_NO_ATTRIBUTE, E_NO_FIELD, E_NO_MEMBER, E_NOT_CALLABLE, E_REDEFINED,
     E_RETURN_OUTSIDE_FN,
     E_RETURN_TYPE, E_STRUCT_FIELD, E_TYPE_MISMATCH, E_UNDEFINED,
@@ -262,8 +263,12 @@ def edit_distance(a: str, b: str) -> int:
 
 
 class Analyzer:
-    def __init__(self, stdlib: StdLib | None = None):
+    def __init__(self, stdlib: StdLib | None = None,
+                 filename: str = "", source_lines: list[str] | None = None):
         self.stdlib = stdlib or StdLib()
+        # 当前分析的源文件与其行内容 —— 诊断要带上它们才能跨文件正确定位。
+        self.filename = filename
+        self.source_lines = source_lines
         self.diagnostics: list[Diagnostic] = []
         self.global_scope = Scope(None, "global")
         self.scope = self.global_scope
@@ -278,13 +283,25 @@ class Analyzer:
         # 成员访问的容器由 `_expr_Member` 直接处理，不经过 `_expr_Identifier`）；
         # 未标记的裸类型名出现在**值位置**即为用法错误。
         self._type_entry_uses: set[int] = set()
-        # 正在加载的本机模块（防循环引入无限递归）
+        # 正在加载的本机模块（防循环引入无限递归）。
+        # 用 `set` 判重（按 realpath），用 `list` 记**引入链**用于报错展示。
         self._loading_modules: set[str] = set()
+        self._loading_names: list[str] = []
         # 以「命名空间」形式引入的本机模块：{模块名: {导出名, ...}}
         # 用于 `工具.平方(...)` 的成员校验（与内置模块同一套检查）
         self.imported_file_modules: dict[str, set[str]] = {}
         # 以「命名空间」形式引入的本机模块名集合（供构造器识别）
         self.imported_file_names: set[str] = set()
+        # 「裸类型名」→ 它来自哪个模块文件（仅对**被引入模块**的类型登记）。
+        #
+        # 为什么需要：整模块引入（`引入 "领域模型"`）按 SPEC §3.8.1 只做
+        # **命名空间绑定**，运行期不会把 `领域模型` 里的类型绑到本文件，
+        # 故本文件裸写 `单据状态` 应当在**编译期**就报错，而不是拖到运行期
+        # 变成「没有定义」。此处记录来源，专为生成这句可行动的诊断。
+        self._module_types: dict[str, str] = {}
+        # 由调用方注入的模块**完整路径解析函数**（与解释器共用同一份实现）。
+        # 两处各写一份候选路径必然分叉 —— 这正是项目铁律的落实。
+        self._module_fullpath = None
         # 供解释器复用的旁表（id(节点) → 类型信息）
         self.struct_instances: dict[int, StructType] = {}
         self.enum_instances: dict[int, EnumType] = {}
@@ -300,12 +317,14 @@ class Analyzer:
     def err(self, code: str, message: str, span: Span,
             hints: list[str] | None = None) -> None:
         self.diagnostics.append(
-            Diagnostic(code, message, span, Severity.ERROR, hints or []))
+            Diagnostic(code, message, span, Severity.ERROR, hints or [],
+                       file=self.filename, source_lines=self.source_lines))
 
     def warn(self, code: str, message: str, span: Span,
              hints: list[str] | None = None) -> None:
         self.diagnostics.append(
-            Diagnostic(code, message, span, Severity.WARNING, hints or []))
+            Diagnostic(code, message, span, Severity.WARNING, hints or [],
+                       file=self.filename, source_lines=self.source_lines))
 
     def _push(self, kind: str = "block") -> Scope:
         self.scope = Scope(self.scope, kind)
@@ -784,24 +803,34 @@ class Analyzer:
         from .lexer import Lexer
         from .parser import Parser
 
-        path = name if name.endswith(".sy") else name + ".sy"
-        candidates = []
-        base = getattr(self.stdlib, "base_dir", None)
-        if base:
-            candidates.append(os.path.join(base, path))
-        candidates.append(path)
-        candidates.append(os.path.join(os.getcwd(), path))
-        if os.path.isabs(path):
-            candidates.insert(0, path)
-
-        full = next((c for c in candidates if os.path.isfile(c)), None)
+        # 模块路径解析走**唯一入口** `StdLib.resolve_module_file` ——
+        # 与解释器 `_load_module_file` 共用同一份候选路径实现。
+        full = self.stdlib.resolve_module_file(name)
         if full is None:
             return False
         real = os.path.realpath(full)
         if real in self._loading_modules:
-            # 循环引入：不报错，也不再展开（与运行期一致，避免死递归）
+            # **循环引入：明确报错，不再静默返回**。
+            #
+            # 早期版本此处 `return True`（什么都不引入，也不报错），本意是
+            # 「避免死递归」。但实测发现两个问题：
+            #   ① **运行期没有同口径防护** —— 语义层放行、运行期照旧递归，
+            #      子解释器层层展开直到撞上「递归太深」，报出的是一个与真因
+            #      无关的错误（实测：甲↔乙 循环引入 ⇒ D4002）；
+            #   ② 静默不引入会使模块成员查不到，报出「没有定义 模块名」，
+            #      同样指不到真因。
+            # 循环引入在业务工程里几乎总是写错了（ERP 里极易在「服务层互相
+            # 调用」时踩到），且**有确定的正确改法**：把公共部分抽成第三个模块。
+            # 故此处直接报错并给出改法，两侧同口径。
+            self.err(E_IMPORT_CYCLE,
+                     f"模块循环引入：「{name}」在引入链上又回到了自己"
+                     f"（{' → '.join(self._loading_names + [name])}）。",
+                     node.span,
+                     ["把两个模块都要用的部分抽成第三个模块，两边各自引入它",
+                      "或把互相调用的逻辑合并到同一个模块里"])
             return True
         self._loading_modules.add(real)
+        self._loading_names.append(name)
 
         try:
             return self._import_module_file_inner(node, name, full, real)
@@ -813,6 +842,8 @@ class Analyzer:
             # `引入 "甲"`，第二次静默失效。用 finally 而非各分支补齐，
             # 是因为中途还有多处 `return`（找不到文件、解析失败等）。
             self._loading_modules.discard(real)
+            if self._loading_names and self._loading_names[-1] == name:
+                self._loading_names.pop()
 
     def _import_module_file_inner(self, node: Use, name: str,
                                   full: str, real: str) -> bool:
@@ -825,9 +856,18 @@ class Analyzer:
         except OSError:
             return False
 
-        sub = Analyzer(self.stdlib)
+        sub = Analyzer(self.stdlib, filename=full,
+                       source_lines=text.splitlines())
         sub._loading_modules = self._loading_modules
+        sub._loading_names = self._loading_names
+        # **被引入模块的诊断必须回流**。此前 `sub.analyze(...)` 的返回值
+        # 被直接丢掉，于是模块内部的错误（未定义变量、类型不符……）
+        # **一条都不会上报**：`sy 检查 主.sy` 报「没有发现问题」，
+        # 而主文件引入的模块里有个必然崩溃的错误 —— 静态检查形同虚设。
+        # 多文件工程（尤其 ERP 这类 8~10 个文件的）对此最敏感。
+        # 子分析器已按自身 filename / source_lines 生成诊断，故无需补标。
         sub.analyze(Parser(Lexer(text, full).tokenize(), full).parse())
+        self.diagnostics.extend(sub.diagnostics)
 
         # 只导出**顶层**定义；下划线开头的名字视为模块私有
         exported = {n: s for n, s in sub.global_scope.symbols.items()
@@ -844,6 +884,20 @@ class Analyzer:
             for n in node.names:
                 if n in exported:
                     sym = exported[n]
+                    if sym is None:
+                        # **被点名导出的名字是「类型」**。
+                        #
+                        # 类型不放在作用域符号表里（上面用 `setdefault(n, None)`
+                        # 并入了导出集），故此处 `sym` 为 None —— 早期代码直接
+                        # 读 `sym.type`，于是 `引入 { 类型名 } 从 "模块"`
+                        # **让宿主 Python 抛 AttributeError 崩掉**，用户看到的
+                        # 是一段 Python 堆栈，而不是枢言诊断。这是「宿主崩溃」
+                        # 而非「语言报错」，性质比普通缺陷更严重。
+                        # 类型本身已由下面「按名引入」分支并入类型表，
+                        # 这里只补一条符号，使名字在作用域里「有定义」。
+                        self.global_scope.define(Symbol(
+                            name=n, type=ANY, span=node.span, used=True))
+                        continue
                     self.global_scope.define(Symbol(
                         name=n, type=sym.type, span=node.span, used=True,
                         is_function=sym.is_function, params=sym.params,
@@ -864,13 +918,39 @@ class Analyzer:
             self.imported_file_modules[modname] = set(exported)
             self.imported_file_names.add(modname)
 
-        # 类型定义一并合并：模块里的结构体 / 枚举要能在本文件使用
-        self.struct_types.update(
-            {k: v for k, v in sub.struct_types.items() if not k.startswith("_")})
-        self.enum_types.update(
-            {k: v for k, v in sub.enum_types.items() if not k.startswith("_")})
-        self.type_aliases.update(
-            {k: v for k, v in sub.type_aliases.items() if not k.startswith("_")})
+        # 类型定义一并合并：模块里的结构体 / 枚举要能在本文件使用。
+        #
+        # **但合并的范围取决于引入形式**（SPEC §3.8.1）：
+        #   · 按名引入（`引入 { X } 从 "模块"`）→ 类型**直接绑定**，
+        #     `X(...)` / `X.成员` 都能裸用，故并入本文件；
+        #   · 整模块引入（`引入 "模块"`）→ 只绑**命名空间**，
+        #     必须写 `模块.X(...)` / `模块.X.成员`，**不能裸用**。
+        #
+        # 早期实现**不分引入形式一律并入**，于是整模块引入后裸用类型名
+        # 也能通过静态检查 —— 可运行期只绑命名空间，结果必然报
+        # 「没有定义」；更糟的是报错位置显示为「第 0 行，第 0 列」
+        # （运行期的类型查找拿不到源码位置），用户完全无从下手。
+        # 「同一语义两处实现必然分叉」：语义层宽松、运行期严格，
+        # 于是**假通过**。现在两侧同口径。
+        mod_types = {k: v for k, v in sub.struct_types.items()
+                     if not k.startswith("_")}
+        mod_enums = {k: v for k, v in sub.enum_types.items()
+                     if not k.startswith("_")}
+        mod_aliases = {k: v for k, v in sub.type_aliases.items()
+                       if not k.startswith("_")}
+        if node.names:
+            # 按名引入：只并入**被点名的**类型，与「按名直接绑定」口径一致。
+            picked = set(node.names)
+            self.struct_types.update(
+                {k: v for k, v in mod_types.items() if k in picked})
+            self.enum_types.update(
+                {k: v for k, v in mod_enums.items() if k in picked})
+            self.type_aliases.update(
+                {k: v for k, v in mod_aliases.items() if k in picked})
+        else:
+            # 整模块引入：**不并入**，只登记来源，供裸用时给出改写建议。
+            for k in list(mod_types) + list(mod_enums) + list(mod_aliases):
+                self._module_types.setdefault(k, modname)
 
         # **传递引入命名空间**（实测缺陷修复）。
         #
@@ -1050,6 +1130,15 @@ class Analyzer:
 
     def _undefined_hints(self, name: str) -> list[str]:
         hints = []
+        # **裸用被引入模块的类型名**：这是整模块引入（命名空间绑定）下
+        # 最常见的写法错误，且必须在**编译期**拦下。
+        # 若放行，运行期只会报「没有定义 X」且位置是「第 0 行 0 列」，
+        # 用户根本不知道要去写 `模块.X`。
+        owner = self._module_types.get(name)
+        if owner:
+            hints.append(
+                f"「{name}」是模块「{owner}」里的类型，整模块引入只绑命名空间："
+                f"请写 `{owner}.{name}`，或改成 `引入 {{ {name} }} 从 \"{owner}\"`")
         cands = self._suggest(name)
         if cands:
             hints.append("你是不是想写：" + " / ".join(cands))

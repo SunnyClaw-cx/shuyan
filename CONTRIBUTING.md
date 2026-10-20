@@ -241,12 +241,14 @@ benchmarks/            性能基准
 ```bash
 PY="python"   # 或你的解释器路径
 
-# 1. 自测（内置，55 项，必须全绿）
+# 1. 自测（内置，59 项，必须全绿）
 "$PY" sy.py 测试
 
 # 2. 示例程序与工程样例（必须全部跑通）
 "$PY" sy.py 运行 examples/*.sy
 "$PY" sy.py 运行 projects/库存管理/主程序.sy
+"$PY" sy.py 运行 projects/应收对账/主程序.sy
+"$PY" sy.py 运行 projects/ERP/主程序.sy
 
 # 3. 静态检查（必须零问题；**多文件参数会全处理**）
 "$PY" sy.py 检查 examples/*.sy projects/*/*.sy
@@ -308,6 +310,25 @@ PY="python"   # 或你的解释器路径
 - 环境（Python 版本、操作系统）
 
 **若是「静默失败」类问题（算错了但不报错），请在标题中标注 —— 这是最高优先级。**
+
+### 规模类问题请附可复现规模
+
+若问题是「大输入 / 深嵌套 / 超长内容」才触发，请一并给出规模参数，
+并优先用仓库现成工具复现：
+
+```bash
+# 极端形态探针（44 项，宿主异常算失败）
+"$PY" tools/probe_extreme.py
+
+# 确定性大工程（同命令两次运行逐字节一致）
+"$PY" tools/gen_big_project.py .tmpbig --modules 200 --records 3000 \
+      --funcs 24 --types 60
+"$PY" sy.py 检查 .tmpbig/*.sy
+"$PY" sy.py 运行 .tmpbig/主程序.sy
+```
+
+> 规模类缺陷（如宿主栈溢出、超长标识符截断）在小示例里**永远碰不到**，
+> 只有上万行或极端输入才暴露。附规模参数是让维护者一次复现的关键。
 
 ---
 

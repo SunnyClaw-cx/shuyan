@@ -15,23 +15,47 @@ from .ast_nodes import (
     Assign, Binary, Call, Compare, ExprStmt, ForEach, FuncDef, Identifier,
     If, Literal, Node, Program, RepeatTimes, While, walk,
 )
-from .diagnostics import Diagnostic, Severity
+from .diagnostics import Diagnostic, Severity, E_TOO_DEEP
 from .lexer import Kind, Lexer
 from .semantic import Analyzer
-from .source import display_width
+from .source import Span, display_width
 from .builtins import StdLib
 
 MAX_WIDTH = 100
 
 
+def _too_deep_diag(source: str) -> Diagnostic:
+    """把漏网的 RecursionError 转成枢言诊断（兜底用）。
+
+    位置取「最深处的那一行」不可得（栈已展开），故指向第 1 行并说明
+    这是整体性问题 —— 好过让用户面对一段 Python 堆栈。
+    """
+    lines = source.splitlines()
+    return Diagnostic(
+        E_TOO_DEEP,
+        "源码嵌套太深，已超出本实现可安全解析的深度。",
+        Span(1, 1, 1, 1), Severity.ERROR,
+        ["把深层嵌套拆成多个中间变量或函数",
+         "括号 / 列表 / 语句块的嵌套层数越少越好",
+         f"（本文件共 {len(lines)} 行）"],
+    )
+
+
 class Linter:
-    def __init__(self, stdlib: StdLib | None = None):
+    def __init__(self, stdlib: StdLib | None = None,
+                 filename: str = "", source_lines: list[str] | None = None):
         self.stdlib = stdlib or StdLib()
+        self.filename = filename
+        self.source_lines = source_lines
         self.diagnostics: list[Diagnostic] = []
 
     def lint(self, program: Program, source: str) -> list[Diagnostic]:
-        # 语义层检查（错误 + 警告一并收集）
-        analyzer = Analyzer(self.stdlib)
+        # 语义层检查（错误 + 警告一并收集）。
+        # 带上文件名与源码行：被引入模块的诊断会回流（见 semantic），
+        # 必须能区分「这条来自哪个文件」并在正确文件里画下划线。
+        analyzer = Analyzer(self.stdlib, filename=self.filename,
+                            source_lines=self.source_lines
+                            or source.splitlines())
         _, diags = analyzer.analyze(program)
         self.diagnostics.extend(diags)
 
@@ -192,7 +216,15 @@ def lint_source(source: str, stdlib: StdLib | None = None,
     try:
         tokens = Lexer(source, filename).tokenize()
         program = Parser(tokens, filename).parse()
+        linter = Linter(stdlib, filename=filename,
+                        source_lines=source.splitlines())
+        return program, linter.lint(program, source)
     except (LexError, ParseError) as exc:
         return None, exc.diagnostics
-    linter = Linter(stdlib)
-    return program, linter.lint(program, source)
+    except RecursionError:
+        # **兜底**：解析器的嵌套深度守卫（`MAX_NEST_DEPTH`）是**结构相关**
+        # 的预算 —— 括号、列表、块嵌套每层消耗的 Python 帧数不同，
+        # 无法用一个常数精确覆盖所有形态。万一仍有形态漏网并撞爆宿主栈，
+        # 这里把它转成枢言诊断，而不是让用户看到一段 Python 堆栈。
+        # 「守卫负责给好建议，兜底负责绝不崩宿主」，两道并存。
+        return None, [_too_deep_diag(source)]
