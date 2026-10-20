@@ -502,6 +502,57 @@ def test_negative_silent_failure():
     expect_compile_error("输出(1, 2 的 3)", "D2001", "的")
 
 
+def _parse_error_lines(source: str) -> list[int]:
+    """解析源码，返回所有**语法错误**所在的行号列表（按出现顺序）。"""
+    from .diagnostics import Severity
+    from .lexer import LexError
+    try:
+        program = Parser(Lexer(source).tokenize()).parse()
+        from .semantic import Analyzer
+        _, diags = Analyzer(StdLib()).analyze(program)
+    except (LexError, ParseError) as exc:
+        diags = exc.diagnostics
+    return [d.span.line for d in diags if d.severity is Severity.ERROR]
+
+
+@group("负例·错误恢复（一行一错）")
+def test_error_recovery_one_per_line():
+    """**一个语法错误只该报一条**，且不得级联到后续无关行。
+
+    这是实测暴露的「demo 感」硬伤：`定义 乙 == 2` 一行曾报出 2 条错误，
+    并进一步污染下一行，最终 **1 个错变 4 个错** —— 用户会以为
+    自己写错了四个地方，实际只错了一个。
+
+    实现方式是**行级恐慌恢复**：语句中途出错即丢弃本行剩余记号、
+    停到下一行行首（`Parser._sync_to_next_line`），
+    并在守卫里避免对已出错的语句「补刀」。
+
+    断言的是**报错条数**与**行号集合** —— 这才是用户实际看到的东西。
+    """
+    # ① 单行一个错 ⇒ 恰好一条
+    lines = _parse_error_lines("定义 乙 == 2\n")
+    expect_eq(len(lines), 1, f"单行错误应报 1 条，实际 {len(lines)} 条：{lines}")
+
+    # ② 错误不得级联到后续无关行
+    src = "定义 甲 = 1\n定义 乙 == 2\n定义 丙 = 3\n输出(丙)\n"
+    lines = _parse_error_lines(src)
+    expect_eq(len(lines), 1, f"错误级联了：{lines}")
+    expect_eq(lines, [2], "报错行号应指向真正出错的那一行")
+
+    # ③ 两处独立错误 ⇒ 两条（不是一条，也不是四条）
+    src2 = "定义 甲 = 1\n输出(甲 +)\n定义 丙 = (1 + 2\n定义 丁 = 4\n输出(丁)\n"
+    lines2 = _parse_error_lines(src2)
+    expect_eq(len(lines2), 2, f"两处错误应报 2 条，实际 {len(lines2)} 条：{lines2}")
+
+    # ④ 缺口括号：报错后不能把后续整行吞掉
+    src3 = "输出(甲 +\n定义 丙 = 3\n输出(丙)\n"
+    lines3 = _parse_error_lines(src3)
+    expect_eq(len(lines3), 1, f"未闭合括号只应报一条：{lines3}")
+
+    # ⑤ 正确程序零报错（恢复机制不得误伤正常路径）
+    expect_eq(_parse_error_lines("定义 甲 = 1\n输出(甲)\n"), [], "正常程序不应有报错")
+
+
 @group("标准库·幂与函数式写法")
 def test_stdlib_power():
     expect_output("输出(次方(2, 10))", ["1024"])
@@ -557,7 +608,11 @@ def test_struct_text_nested():
 定义 甲 = 员工(姓名 是 "陈工", 工号 是 "E001", 工资 是 8500.5)
 输出(甲.姓名 + "(" + 甲.工号 + ")")
 输出(甲)
-""", ['陈工(E001)', '员工{姓名: "陈工", 工号: "E001", 工资: 8500.5}'])
+""", ['陈工(E001)', '员工{姓名: 陈工, 工号: E001, 工资: 8500.5}'])
+    # **文本字段不带引号**：`输出` 走的是面向用户的口径（`display`），
+    # 与 `输出(甲.姓名)` 得到 `陈工` 必须一致。若这里带引号，同一个值
+    # 取出来是 `陈工`、整体打印却是 `"陈工"` —— 同一语义两种表示。
+    # （调试口径 `repr` 仍带引号，供 Python 层与报错摘要使用。）
 
     # 结构体作字段类型
     expect_output("""
@@ -1037,6 +1092,66 @@ def test_stdlib_modules():
     expect_output('引入 "加密"\n输出(加密.MD5(""))',
                   ["d41d8cd98f00b204e9800998ecf8427e"])
     expect_output('引入 "正则"\n输出(正则.是否匹配("abc123", "\\\\d+"))', ["真"])
+
+
+@group("标准库·高阶函数")
+def test_stdlib_higher_order():
+    """高阶函数：函数作为一等公民（筛选 / 映射列表 / 归约 …）。
+
+    这是「能不能写真实程序」的分水岭 —— 没有它们，用户只能手写
+    `当` + `入列` 的循环，代码冗长、易错，且无法表达「按字段排序」
+    这类需求。
+    """
+    # 具名函数与匿名函数都必须能当参数传
+    expect_output(
+        '请 大于二(x)\n    返回 x > 2\n结束\n'
+        '输出(筛选([1, 2, 3, 4, 5], 大于二))', ["[3, 4, 5]"])
+    expect_output('输出(筛选([1, 2, 3, 4, 5], 函数(x) 返回 x > 2 结束))',
+                  ["[3, 4, 5]"])
+    expect_output('输出(映射列表([1, 2, 3], 函数(x) 返回 x * x 结束))',
+                  ["[1, 4, 9]"])
+
+    # 归约：有初值 / 无初值（无初值时以首元素起步）
+    expect_output('输出(归约([1, 2, 3, 4], 函数(a, b) 返回 a + b 结束, 0))',
+                  ["10"])
+    expect_output('输出(归约([1, 2, 3, 4], 函数(a, b) 返回 a + b 结束))',
+                  ["10"])
+
+    # 任何 / 全部：空列表时「任何」为假、「全部」为真（与数学约定一致）
+    expect_output('输出(任何([1, 2, 3], 函数(x) 返回 x > 2 结束))', ["真"])
+    expect_output('输出(任何([1, 2, 3], 函数(x) 返回 x > 9 结束))', ["假"])
+    expect_output('输出(全部([1, 2, 3], 函数(x) 返回 x > 0 结束))', ["真"])
+    expect_output('输出(全部([], 函数(x) 返回 x > 0 结束))', ["真"])
+    expect_output('输出(任何([], 函数(x) 返回 x > 0 结束))', ["假"])
+
+    # 查找首个：找不到返回「空」，而不是报错
+    expect_output('输出(查找首个([1, 2, 3], 函数(x) 返回 x > 2 结束))', ["3"])
+    expect_output('输出(查找首个([1, 2, 3], 函数(x) 返回 x > 9 结束))', ["空"])
+
+    # 排序依据 / 分组依据 / 计数依据 / 映射值
+    expect_output('输出(排序依据([3, 1, 2], 函数(x) 返回 0 - x 结束))',
+                  ["[3, 2, 1]"])
+    expect_output('输出(排序依据([1, 2, 3], 函数(x) 返回 x 结束, 真))',
+                  ["[3, 2, 1]"])
+    expect_output('输出(计数依据(["甲", "乙", "甲"], 函数(x) 返回 x 结束))',
+                  ["{甲: 2, 乙: 1}"])
+    expect_output('输出(映射值({"甲": 1}, 函数(v) 返回 v * 10 结束))',
+                  ["{甲: 10}"])
+
+    # 真值规则与语言内 `如果` 完全一致：0 / "" / 空列表 都算假
+    expect_output('输出(筛选([0, 1, 2], 函数(x) 返回 x 结束))', ["[1, 2]"])
+
+    # 文本也可遍历（逐字）
+    expect_output('输出(筛选("你好世界", 函数(c) 返回 c != "好" 结束))',
+                  ["[你, 世, 界]"])
+
+    # 传入非函数：必须给出**可行动的**报错，而不是宿主异常
+    expect_runtime_error('输出(筛选([1, 2], 5))',
+                         "第 2 个参数应该是函数")
+
+    # 空列表 + 无初值的归约：明确报错，不得静默返回空值
+    expect_runtime_error('输出(归约([], 函数(a, b) 返回 a + b 结束))',
+                         "必须给出初值")
 
 
 @group("标准库·类型名")

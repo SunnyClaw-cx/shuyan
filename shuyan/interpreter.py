@@ -123,6 +123,23 @@ class Interpreter:
             m = ShuyanMap(dict(members))
             self.global_env.vars[mod] = m
             self._module_cache[mod] = m
+        # **回调宿主注入**：高阶函数（筛选 / 映射列表 / 归约 …）需要从
+        # 内置函数内部回调枢言函数。枢言函数必须经解释器执行（它要用到
+        # 作用域链、调用栈、返回信号），内置函数自己做不到，故由解释器
+        # 把自己的调用能力交给标准库。
+        #
+        # 只在**解释器存在**时注入 —— 静态检查、文档生成等场景拿不到它，
+        # 那些场景下调用高阶函数会给出明确报错，而不是静默失败。
+        self.stdlib.callback = self._invoke_shuyan
+
+    def _invoke_shuyan(self, fn, args: list):
+        """供标准库回调枢言函数的唯一入口。
+
+        `_call_shuyan` 需要一个 Span 来标注调用链，而内置函数此刻手上
+        没有源码位置 —— 用空 Span 占位，调用链里显示为「内置函数」，
+        同样能定位到「是哪个内置函数回调进来的」。
+        """
+        return self._call_shuyan(fn, list(args), {}, Span(0, 0, 0, 0))
 
     # ------------------------------------------------------------ 入口
 

@@ -88,6 +88,11 @@ class Parser:
         self.diagnostics: list[Diagnostic] = []
         self._loop_depth = 0
         self._func_depth = 0
+        self._error_count = 0        # 恐慌模式恢复用（见 _sync_to_next_line）
+        self._stmt_mark = 0          # 进入当前语句时的错误计数
+        # 同一根因已报错 ⇒ 抑制随之而来的「衍生」报错（如缺操作数之后的
+        # 「括号未闭合」）。每条语句开始时重置。
+        self._suppress_followup = False
 
     # ------------------------------------------------------------ 记号工具
 
@@ -159,9 +164,47 @@ class Parser:
                hints: list[str] | None = None,
                severity: Severity = Severity.ERROR) -> None:
         self.diagnostics.append(Diagnostic(code, message, span, severity, hints or []))
+        if severity is Severity.ERROR:
+            self._error_count += 1
+
+    def _mark(self) -> int:
+        """记录当前已产生的**错误**条数，供语句层判断「本条是否出错」。"""
+        return self._error_count
+
+    def _sync_to_next_line(self, mark: int) -> None:
+        """恐慌模式恢复：本条语句期间产生过错误 ⇒ 跳到下一行行首。
+
+        **为什么必须这样做**：解析器一旦在语句中途出错，后续记号已经
+        失去可靠的上下文，继续按原语法硬解析会产生**级联假错误**
+        （实测：`定义 乙 == 2` 一行会报出 2 条，并进一步污染下一行，
+        最终 1 个错变 4 个错）。真正的编译器不会这样 ——
+        用户写错一行，就应该只看到那**一行**的问题。
+
+        做法：若本条语句期间新增了错误，则丢弃本行剩余记号，直接把游标
+        移到下一个换行之后。这牺牲了「同一行多错」的报告能力，
+        换来的是**报错数量与用户真实的错误数量成正比** —— 这才是对的取舍。
+
+        若本条**没有**出错则原地不动（正常路径零开销）。
+        """
+        if self._error_count == mark:
+            return
+        depth = 0
+        while not self._check_kind(Kind.EOF):
+            tok = self._cur()
+            if tok.kind is Kind.NEWLINE and depth == 0:
+                break
+            if tok.kind is Kind.OP:
+                if tok.value in ("(", "[", "{"):
+                    depth += 1
+                elif tok.value in (")", "]", "}"):
+                    depth = max(0, depth - 1)
+            self._advance()
+        # 吃掉换行本身，停在下一条语句的行首
+        if self._check_kind(Kind.NEWLINE):
+            self._advance()
 
     def _synchronize(self) -> None:
-        """错误恢复：跳到下一个语句起点，保证一次报告多个错误。"""
+        """跳到下一个语句起点，保证一次报告多个错误。"""
         while not self._check_kind(Kind.EOF):
             if self._check_kind(Kind.NEWLINE):
                 self._advance()
@@ -215,6 +258,9 @@ class Parser:
             if tok.kind is Kind.KEYWORD and tok.value in stop_values:
                 break
             before = self.i
+            mark = self._mark()
+            self._stmt_mark = mark
+            self._suppress_followup = False
             stmt = self._parse_statement()
             if stmt is not None:
                 stmts.append(stmt)
@@ -224,6 +270,9 @@ class Parser:
                             f"无法解析的记号「{tok.text}」。", tok.span)
                 self._advance()
                 self._synchronize()
+            else:
+                # 本条语句出错 ⇒ 丢弃本行剩余记号，防止级联假错误
+                self._sync_to_next_line(mark)
         return stmts
 
     # ------------------------------------------------------------ 单条语句
@@ -398,11 +447,16 @@ class Parser:
         return ExprStmt(span=start_span, expr=expr)
 
     def _guard_trailing_tokens(self, span: Span) -> None:
-        """把「表达式后面还有值」的情况变成明确报错，而不是静默丢弃。
+        """语句解析完却还有剩余记号 ⇒ 明确报错，而不是静默丢弃。
 
         **为什么必须加这道守卫**：静默丢弃比报错危险得多。`2 的 10 次方`
         若被解析成 `2` 且不报错，用户会以为语言算错了——这是最坏的一类
         缺陷（错误结果 + 无人察觉）。守卫把它变成一句可读的提示。
+
+        **守卫对象是「任何残余记号」**，不限于像值的记号。曾经只拦「像值」
+        的记号，于是 `定义 乙 == 2` 里剩下的 `==`（不是值起始）被静默放过，
+        再由下一轮把它当成新语句报错 —— 一行错被拆成两条、指向两个位置，
+        用户会以为写错了两个地方。**一行错只该报一条**。
 
         提示指向**根因**（紧邻前一个记号的非法字），而非紧跟其后的记号，
         这样用户一眼就能看到是哪个字出了问题。
@@ -413,17 +467,47 @@ class Parser:
         if tok.value in (";", ",", "}", "end", "else", "elif", "catch",
                          "finally", ")"):
             return
-        if not self._starts_value():
+        # **本条语句已经报过错 ⇒ 不再补刀。**
+        # 例：`定义 乙 = (1 + 2` 的括号未闭合，报错发生在换行之后
+        # （游标已跨行），此时守卫若再报一次「这里不该出现『定义』」，
+        # 用户会看到同一行的两条错误、且第二条指向了下一行的关键字。
+        # 一行错只报一条，第一条（更接近根因的那条）已足够。
+        if self._error_count > self._stmt_mark:
+            self._skip_to_line_end()
             return
-        # 报错位置应当落在**那个多出来的值记号**上（如 `2 的 10 次方` 中的 `的`），
-        # 而不是它前面的正确表达式——指错位置等于把人往错方向带。
-        self._error(E_UNEXPECTED_TOKEN,
-                    f"「{tok.text}」两侧没有运算符，枢言无法理解这里的意图。",
-                    tok.span,
-                    ["中文里像「的」这样的常用字不是运算符",
-                     "如果要求幂，请写 `次方(底, 指数)` 或 `底 ^ 指数`",
-                     "如果是要拼接文本，请写 `+`"])
-        self._synchronize()
+        if self._starts_value():
+            # 像值的残余：多为 `2 的 10 次方` 这类「中文词当运算符」的误用
+            self._error(E_UNEXPECTED_TOKEN,
+                        f"「{tok.text}」两侧没有运算符，枢言无法理解这里的意图。",
+                        tok.span,
+                        ["中文里像「的」这样的常用字不是运算符",
+                         "如果要求幂，请写 `次方(底, 指数)` 或 `底 ^ 指数`",
+                         "如果是要拼接文本，请写 `+`"])
+        else:
+            # 其他残余（运算符、意外的关键字等）：同样是语句没写完
+            self._error(E_UNEXPECTED_TOKEN,
+                        f"这里不该出现「{tok.text}」。",
+                        tok.span,
+                        ["检查这一行是否漏写、或写错了符号",
+                         "一条语句应当在一个概念内写完"])
+        # 丢弃本行剩余记号，避免同一行被拆成多条错误
+        self._skip_to_line_end()
+
+    def _skip_to_line_end(self) -> None:
+        """丢弃本行剩余记号（括号内的也一并跳过），停在行尾（不含换行）。"""
+        depth = 0
+        while not self._check_kind(Kind.EOF):
+            tok = self._cur()
+            if tok.kind is Kind.NEWLINE and depth == 0:
+                return
+            if tok.kind is Kind.OP:
+                if tok.value in ("(", "[", "{"):
+                    depth += 1
+                elif tok.value in (")", "]", "}"):
+                    if depth == 0:
+                        return
+                    depth -= 1
+            self._advance()
 
     def _starts_value(self) -> bool:
         """当前记号是否可以作为「值」的开始（用于无括号调用的判定）。"""
@@ -889,6 +973,26 @@ class Parser:
                 break
 
             op_tok = self._advance()
+            # **二元运算符的右操作数不得跨行到「语句起始关键字」。**
+            #
+            # `输出(甲 +` 换行后紧跟 `定义 丙 = 3` —— 若照常去下一行取操作数，
+            # 会把 `定义` 当成表达式的开始，于是报出「这里需要一个表达式，
+            # 但看到了『定义』」，再叠加一条「参数『丙』两侧没有运算符」，
+            # **一条错误（漏了右括号）被放大成两条**，且两条的位置都指向
+            # 下一行的关键字，与真正的根因（第 1 行末尾）相距甚远。
+            #
+            # 直接在这一行收尾：让上层的 `_expect(")")` 报出「括号未闭合」，
+            # 那条提示才指向正确的行。多行运算符续写本就不应跨语句边界。
+            if self._at_stmt_start():
+                self._error(E_EXPECTED_EXPRESSION,
+                            f"「{op_tok.text}」右边缺少操作数。",
+                            op_tok.span,
+                            ["检查这一行的运算符是否漏写了右边的值",
+                             "若上一行有未闭合的 ( 或 [ ，先补齐它"])
+                # 本条语句已出错 ⇒ 后续的「括号未闭合」只是**同一个根因的
+                # 另一面**，不再重复报（否则用户看到两条，以为错了两处）。
+                self._suppress_followup = True
+                break
             # `in` / `not_in` 是关键字
             right = self._parse_expression(rbp)
 
@@ -1007,7 +1111,18 @@ class Parser:
         args: list[Node] = []
         kwargs: dict[str, Node] = {}
         self._skip_newlines()
+        unclosed = False
         while not self._check(")") and not self._check_kind(Kind.EOF):
+            # **参数位置出现「语句起始关键字」⇒ 多半是上一行漏了右括号。**
+            #
+            # 多行参数列表本身合法（样例工程里就有 `造流水(...多行...)`），
+            # 故不能一律禁止跨行。但 `定义`/`如果`/`遍历` 这类关键字
+            # **永远不能作表达式前缀**，它们出现在参数位置只能是
+            # 「括号没闭合」。若不拦，参数列表会**吞掉下一整条语句**，
+            # 把一条错误放大成两三条（实测症状），且报错位置全错。
+            if self._at_stmt_start():
+                unclosed = True
+                break
             # 具名参数：标识符 `是` 值
             if (self._at().kind is Kind.IDENT and self._at(1).value == "is"
                     and self._at(2).value != "is"):
@@ -1033,8 +1148,28 @@ class Parser:
             if not self._match(","):
                 break
             self._skip_newlines()
-        self._expect(")", "函数调用的参数列表未闭合，缺少 )")
+        if unclosed:
+            if not self._suppress_followup:
+                self._error(E_EXPECTED_TOKEN,
+                            "函数调用的参数列表未闭合，缺少 )",
+                            self._cur().span,
+                            ["检查这一行是否漏写了右括号 )",
+                             "若参数要写多行，续行不要以 `定义` 等语句关键字开头"])
+        elif not self._suppress_followup:
+            self._expect(")", "函数调用的参数列表未闭合，缺少 )")
         return Call(span=callee.span, callee=callee, args=args, kwargs=kwargs)
+
+    def _at_stmt_start(self) -> bool:
+        """当前记号是否是「语句起始关键字」。
+
+        这类关键字**不能作表达式前缀**（唯一的例外是 `fn`，
+        它既开启函数定义、也能作匿名函数表达式，故排除）。
+        参数列表 / 索引 / 字面量里遇到它们，即意味着括号未闭合。
+        """
+        tok = self._cur()
+        return (tok.kind is Kind.KEYWORD
+                and tok.value in STMT_STARTERS
+                and tok.value != "fn")
 
     def _parse_index(self, target: Node) -> Node:
         start = self._advance()          # [

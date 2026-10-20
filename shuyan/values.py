@@ -75,8 +75,8 @@ class ShuyanMap:
         return len(self.data) > 0
 
     def __repr__(self) -> str:
-        items = ", ".join(f"{k!r}: {_repr(v)}" for k, v in self.data.items())
-        return "{" + items + "}"
+        # 走容器渲染的唯一实现，不在这里另写一份。
+        return _render(self, _show_repr)
 
 
 @dataclass
@@ -108,8 +108,8 @@ class ShuyanStruct:
         return True
 
     def __repr__(self) -> str:
-        items = ", ".join(f"{k}: {_repr(v)}" for k, v in self.fields.items())
-        return f"{self.type_name}{{{items}}}"
+        # 走容器渲染的唯一实现，不在这里另写一份。
+        return _render(self, _show_repr)
 
 
 @dataclass(frozen=True)
@@ -257,7 +257,7 @@ def format_number(value: float) -> str:
 
 
 def _repr(value) -> str:
-    """值 → 显示文本（中文语境的自然表示）。"""
+    """值 → 显示文本（中文语境的自然表示，文本**加引号**）。"""
     if value is NIL or value is None:
         return "空"
     if isinstance(value, bool):
@@ -266,11 +266,11 @@ def _repr(value) -> str:
         return format_number(value)
     if isinstance(value, str):
         return '"' + value + '"'
-    if isinstance(value, list):
-        return "[" + ", ".join(_repr(v) for v in value) + "]"
-    if isinstance(value, (ShuyanMap, ShuyanStruct)):
-        return repr(value)
+    if isinstance(value, (list, ShuyanMap, ShuyanStruct)):
+        return _render(value, _show_repr)
     if isinstance(value, EnumMember):
+        return repr(value)
+    if isinstance(value, ShuyanType):
         return repr(value)
     if callable(value):
         name = getattr(value, "__name__", "匿名函数")
@@ -291,16 +291,48 @@ def display(value) -> str:
         return format_number(value)
     if isinstance(value, str):
         return value
-    if isinstance(value, list):
-        return "[" + ", ".join(display(v) for v in value) + "]"
-    if isinstance(value, (ShuyanMap, ShuyanStruct)):
-        return repr(value)
+    if isinstance(value, (list, ShuyanMap, ShuyanStruct)):
+        return _render(value, _show_text)
     if isinstance(value, EnumMember):
+        return repr(value)
+    if isinstance(value, ShuyanType):
         return repr(value)
     if callable(value):
         name = getattr(value, "__name__", "匿名函数")
         return f"<函数 {name}>"
     return str(value)
+
+
+def _show_text(value) -> str:
+    """容器内元素的**输出口径**渲染：文本不加引号。"""
+    return display(value)
+
+
+def _show_repr(value) -> str:
+    """容器内元素的**调试口径**渲染：文本加引号。"""
+    return _repr(value)
+
+
+def _render(value, elem) -> str:
+    """**容器渲染的唯一实现**（列表 / 映射 / 结构体）。
+
+    `elem` 决定元素用哪种口径渲染 —— `display` 传不加引号的，
+    `_repr` 传加引号的。容器结构本身只写一份，两种口径共用。
+
+    为什么必须收敛成一份：此前列表在 `display` 里手写一份（元素不加
+    引号）、映射在 `ShuyanMap.__repr__` 里又写一份（键用 Python 的
+    `{k!r}`，带单引号）、结构体再写一份。结果同一个文本值在列表里是
+    `[甲, 乙]`、在映射里是 `{'甲': 1}` —— 用户直接就能看到的不一致。
+    """
+    if isinstance(value, list):
+        return "[" + ", ".join(elem(v) for v in value) + "]"
+    if isinstance(value, ShuyanMap):
+        return "{" + ", ".join(f"{elem(k)}: {elem(v)}"
+                               for k, v in value.data.items()) + "}"
+    if isinstance(value, ShuyanStruct):
+        return value.type_name + "{" + ", ".join(
+            f"{k}: {elem(v)}" for k, v in value.fields.items()) + "}"
+    raise TypeError("_render 只处理容器类型")
 
 
 def to_text(value) -> str:

@@ -89,10 +89,49 @@ class StdLib:
         self.stdout = stdout if stdout is not None else sys.stdout
         self.written: list[str] = []      # 捕获输出（供测试与工具使用）
         self.capture = False
+        # **回调宿主**：由解释器注入，用于从内置函数内部调用枢言函数。
+        #
+        # 为什么需要：高阶函数（筛选 / 映射列表 / 归约 …）必须能把用户传入的
+        # 枢言函数**回调**起来。而枢言函数需要解释器上下文（作用域链）才能
+        # 执行，内置函数本身拿不到这些。故解释器把自己的调用能力注入进来，
+        # 内置函数通过 `_invoke(fn, args)` 使用。
+        #
+        # 未注入时（如静态检查、文档生成等无解释器的场景）调用会给出
+        # 明确报错，而不是静默失败。
+        self.callback = None
         self.core: dict[str, object] = {}
         self.modules: dict[str, dict[str, object]] = {}
         self._build_core()
         self._build_modules()
+
+    # -------------------------------------------------------- 回调通道
+
+    def _invoke(self, fn, args: list, where: str):
+        """把枢言函数回调起来（高阶函数的实现基础）。
+
+        不是函数就明确报错 —— 传入 `筛选(数据, 5)` 这类写法时，
+        用户应当看到「第 2 个参数需要函数」，而不是一条
+        「'int' object is not callable」式的宿主异常。
+        """
+        from .interpreter import ShuyanFunction      # 延迟导入，避免循环依赖
+        # **两条路径必须分开**：枢言函数要经解释器执行（作用域链、返回信号
+        # 都在解释器手上）；宿主函数（如 `绝对值`）本身就可直接调用。
+        # 若把宿主函数也送去 `callback`，会走进 `_call_shuyan` 并在
+        # 「取 fn.params」处炸出宿主异常 —— 这正是本项目要避免的形态。
+        if isinstance(fn, ShuyanFunction):
+            if self.callback is None:
+                raise error("调用错误",
+                            f"「{where}」需要在运行环境中执行枢言函数，"
+                            f"但当前没有可用的解释器上下文。",
+                            位置=where)
+            return self.callback(fn, args)
+        if callable(fn):
+            return fn(*args)
+        raise error("类型错误",
+                    f"「{where}」的第 2 个参数应该是函数"
+                    f"（如 `函数(x) 返回 x > 0 结束`），"
+                    f"实际收到的是「{type_name(fn)}」。",
+                    位置=where)
 
     # -------------------------------------------------------- 输出通道
 
@@ -186,6 +225,20 @@ class StdLib:
         reg("取键", self._keys)
         reg("取值", self._values)
         reg("有键", lambda m, k: k in _want_map(m, "有键").data)
+
+        # --- 高阶函数（函数作为一等公民）---
+        # 这几个函数是「语言能不能写真实程序」的分水岭：没有它们，
+        # 用户就得手写一堆 `当` + `入列` 的循环，代码冗长且容易写错。
+        reg("筛选", self._filter)
+        reg("映射列表", self._map_list)
+        reg("归约", self._reduce)
+        reg("任何", self._any)
+        reg("全部", self._all)
+        reg("查找首个", self._find_first)
+        reg("排序依据", self._sort_by)
+        reg("分组依据", self._group_by)
+        reg("映射值", self._map_values)
+        reg("计数依据", self._count_by)
 
     def emit_nobreak(self, text: str):
         self.emit_no_newline(text)
@@ -298,6 +351,112 @@ class StdLib:
         except TypeError:
             return sorted(items, key=lambda x: (type_name(x), display(x)),
                           reverse=bool(倒序))
+
+    # ---------------------------------------------------- 高阶函数
+
+    def _filter(self, lst, pred):
+        """筛选(列表, 判定函数) —— 保留判定为真的元素。
+
+        枢言里 `若` 判定为真即真值规则（假/空/0/""/[]/{} 为假），
+        故直接取结果的布尔值，与语言内 `如果` 的判断完全一致。
+        """
+        items = _want_iterable(lst, "筛选")
+        # 判定为真即真值规则（假/空/0/""/[]/{} 为假），与语言内 `如果`
+        # 的判断**同一实现** —— 复用 values.is_truthy，不另造一份。
+        return [x for x in items
+                if is_truthy(self._invoke(pred, [x], "筛选"))]
+
+    def _map_list(self, lst, fn):
+        """映射列表(列表, 变换函数) —— 逐元素变换，返回等长新列表。"""
+        items = _want_iterable(lst, "映射列表")
+        return [self._invoke(fn, [x], "映射列表") for x in items]
+
+    def _reduce(self, lst, fn, init=NIL):
+        """归约(列表, 累积函数, 初值?) —— 把列表折叠为单个值。
+
+        `累积函数(累计, 元素)` 返回新的累计值。
+        未给初值时以首个元素为初值、从第二个开始（与常见语言的 reduce 一致）；
+        空列表且无初值 → 明确报错，而不是返回一个看似正常的空值。
+        """
+        items = _want_iterable(lst, "归约")
+        if init is NIL:
+            if not items:
+                raise error("参数错误",
+                            "归约：空列表必须给出初值（第 3 个参数）。",
+                            函数="归约")
+            acc, rest = items[0], items[1:]
+        else:
+            acc, rest = init, items
+        for x in rest:
+            acc = self._invoke(fn, [acc, x], "归约")
+        return acc
+
+    def _any(self, lst, pred):
+        """任何(列表, 判定函数) —— 任一元素满足即为真。"""
+        items = _want_iterable(lst, "任何")
+        return any(is_truthy(self._invoke(pred, [x], "任何")) for x in items)
+
+    def _all(self, lst, pred):
+        """全部(列表, 判定函数) —— 所有元素都满足才为真（空列表为真）。"""
+        items = _want_iterable(lst, "全部")
+        return all(is_truthy(self._invoke(pred, [x], "全部")) for x in items)
+
+    def _find_first(self, lst, pred):
+        """查找首个(列表, 判定函数) —— 返回首个满足的元素；没有则返回空。"""
+        items = _want_iterable(lst, "查找首个")
+        for x in items:
+            if is_truthy(self._invoke(pred, [x], "查找首个")):
+                return x
+        return NIL
+
+    def _sort_by(self, lst, keyfn, 倒序=False):
+        """排序依据(列表, 取键函数, 倒序?) —— 按键排序，稳定。
+
+        `sorted` 本身稳定，故相等键保持原序 —— 这对「先按类别、再按名称」
+        这类多级排序很重要，用户可连续调用两次得到预期结果。
+        """
+        items = list(_want_iterable(lst, "排序依据"))
+        keys = [self._invoke(keyfn, [x], "排序依据") for x in items]
+        # 键可能有多种类型（数字与文本混排）⇒ 统一用 (类型名, 显示值) 兜底，
+        # 与 `排序` 的处理保持一致，避免 TypeError 直接崩掉。
+        try:
+            order = sorted(range(len(items)),
+                           key=lambda i: keys[i], reverse=bool(倒序))
+        except TypeError:
+            order = sorted(range(len(items)),
+                           key=lambda i: (type_name(keys[i]), display(keys[i])),
+                           reverse=bool(倒序))
+        return [items[i] for i in order]
+
+    def _group_by(self, lst, keyfn):
+        """分组依据(列表, 取键函数) —— 返回映射：键 → 该组元素列表。
+
+        键统一转为文本（映射的键比较是文本比较），组内保持原顺序。
+        """
+        items = _want_iterable(lst, "分组依据")
+        groups: dict = {}
+        for x in items:
+            k = display(self._invoke(keyfn, [x], "分组依据"))
+            groups.setdefault(k, []).append(x)
+        return ShuyanMap(groups)
+
+    def _count_by(self, lst, keyfn):
+        """计数依据(列表, 取键函数) —— 返回映射：键 → 出现次数。
+
+        这是「按类别汇总」最常用的写法，样例工程里手写过这段逻辑。
+        """
+        items = _want_iterable(lst, "计数依据")
+        counts: dict = {}
+        for x in items:
+            k = display(self._invoke(keyfn, [x], "计数依据"))
+            counts[k] = counts.get(k, 0) + 1
+        return ShuyanMap(counts)
+
+    def _map_values(self, mp, fn):
+        """映射值(映射, 变换函数) —— 保留键，变换每个值。"""
+        m = _want_map(mp, "映射值")
+        return ShuyanMap({k: self._invoke(fn, [v], "映射值")
+                          for k, v in m.data.items()})
 
     def _join(self, lst, sep="", *_, **__):
         """连接(列表) / 连接(列表, 分隔符) —— 文本列表 → 文本。"""
