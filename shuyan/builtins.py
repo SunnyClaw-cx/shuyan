@@ -144,22 +144,59 @@ class StdLib:
     def resolve_module_file(self, name: str) -> str | None:
         """把模块名解析成**已存在的** .sy 完整路径；找不到返回 None。
 
-        候选顺序（与 SPEC §3.8.1 一致，基准是主脚本目录）：
-          ① 主脚本目录/base_dir 下的 <name>.sy
-          ② 相对路径 <name>.sy（进程 CWD）
-          ③ CWD 下的 <name>.sy
-          ④ 绝对路径（若 name 本身是绝对路径）
+        候选顺序（与 SPEC §3.8.1 一致）：
+          ① base_dir（主脚本目录）下的 <name>.sy
+          ② base_dir 的各级**父目录**下的 <name>.sy（逐级上溯）
+          ③ 绝对路径（若 name 本身是绝对路径）
+
+        **为什么要有 ② 逐级上溯**
+        --------------------------
+        v0.4.0 之前只有 ①，外加两条**回退到进程 CWD** 的候选。实测暴露出
+        两个问题（见 `tools/probe_layout.py`，可复现）：
+
+          · 分层工程无法逐文件独立检查。工程布局是
+
+                工程/主程序.sy
+                工程/框架/基础.sy
+                工程/采购/服务.sy      ← 写 `引入 "框架/基础"`（相对工程根）
+
+            `sy 运行 工程/主程序.sy` 基准 = 工程/ ⇒ 找得到；
+            而 `sy 检查 工程/采购/服务.sy` 基准 = 工程/采购/ ⇒
+            去找 `工程/采购/框架/基础.sy`，**必然落空**。
+            加了 ② 之后，从 `工程/采购/` 逐级上溯到 `工程/`，
+            恰好命中 —— 两种命令给出同一结论。
+
+          · 解析结果依赖进程 CWD。旧候选里 `<name>.sy`（相对 CWD）与
+            `CWD/<name>.sy` 会在 ① 落空时顶替命中，于是**同一份源码在
+            不同目录下运行会引入不同文件**。SPEC §3.8.1 第 1 条明文写着
+            「**不以当前工作目录为准**」，故这两条回退**必须去掉**。
+
+        **为什么不是「相对自身文件」**：`引入` 语句本身不知道自己在哪个文件，
+        且若按自身目录解析，主程序运行（基准=工程根）与模块独立检查
+        （基准=模块目录）会得到**两套不同的解析结果** —— 那正是要避免的分叉。
+        逐级上溯则两种情形都收敛到同一个「工程根」，天然同口径。
+
+        **上溯边界**：到文件系统根为止，最多 64 级（防御性上限，
+        避免异常路径造成长循环）。
         """
         import os
         path = name if name.endswith(".sy") else name + ".sy"
-        candidates = []
+        if os.path.isabs(path):
+            return path if os.path.isfile(path) else None
+
+        candidates: list[str] = []
         base = getattr(self, "base_dir", None)
         if base:
-            candidates.append(os.path.join(base, path))
+            d = os.path.abspath(base)
+            for _ in range(64):
+                candidates.append(os.path.join(d, path))
+                parent = os.path.dirname(d)
+                if parent == d:
+                    break
+                d = parent
+        # 兜底：相对进程 CWD（仅在 base_dir 完全没给时才可能生效，
+        # 保留是为了不破坏直接以字符串路径调用解析的老用法）。
         candidates.append(path)
-        candidates.append(os.path.join(os.getcwd(), path))
-        if os.path.isabs(path):
-            candidates.insert(0, path)
         return next((c for c in candidates if os.path.isfile(c)), None)
     """标准库集合。由解释器实例化并注入运行上下文。"""
 

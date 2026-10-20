@@ -866,7 +866,34 @@ class Analyzer:
         # 而主文件引入的模块里有个必然崩溃的错误 —— 静态检查形同虚设。
         # 多文件工程（尤其 ERP 这类 8~10 个文件的）对此最敏感。
         # 子分析器已按自身 filename / source_lines 生成诊断，故无需补标。
-        sub.analyze(Parser(Lexer(text, full).tokenize(), full).parse())
+        #
+        # **必须用恢复式解析，且必须把词法/语法错一起回流**（v0.4.0 修复）：
+        # 原先这里写的是 `Parser(...).parse()`，而 `parse()` 一见诊断就
+        # `raise ParseError`（词法阶段则是 `LexError`）。异常在 `_import_module_file`
+        # 里没有人接 —— 于是用户 `sy 检查` 一个引用了**写错的模块**的文件时，
+        # 看到的是一段 **Python 堆栈**，而不是枢言诊断。
+        # 实测三种情形：被引模块语法错（行首运算符 D2012）与词法错
+        # （字符串未闭合 D1002）都会崩，语义错不崩（它走 errors 不回 raise）。
+        # 修法与 v0.3.1 的主路径一致：改用 `parse_recovering()`，
+        # 把「已 recover 的部分 AST + 语法/词法诊断」一并并回诊断流，
+        # 再继续做语义分析 —— 这样模块里的错误能全部报出来，
+        # 且不再有宿主异常。诊断顺序在 `lint_source` 末尾统一按
+        # （行，列）稳定排序，故此处直接 extend 即可。
+        from .diagnostics import LexError, ParseError
+        try:
+            tokens = list(Lexer(text, full).tokenize())
+        except LexError as exc:
+            sub.diagnostics.extend(exc.diagnostics)
+            self.diagnostics.extend(sub.diagnostics)
+            return True          # 词法阶段失败：没有记号流，后续无从谈起
+        try:
+            program, parse_diags = Parser(tokens, full).parse_recovering()
+        except ParseError as exc:            # 防御：recovering 路径不应抛
+            sub.diagnostics.extend(exc.diagnostics)
+            self.diagnostics.extend(sub.diagnostics)
+            return True
+        sub.diagnostics.extend(parse_diags)
+        sub.analyze(program)
         self.diagnostics.extend(sub.diagnostics)
 
         # 只导出**顶层**定义；下划线开头的名字视为模块私有
@@ -1270,7 +1297,76 @@ class Analyzer:
             self._visit_expr(v)
         self._check_builtin_arg_types(node, arg_types)
         self._check_stray_kwargs(node)
+        self._check_call_arg_types(node)
         return rt
+
+    def _check_call_arg_types(self, node: Call) -> None:
+        """用户函数的**实参类型**校验（SPEC §3.2 参数可标类型）。
+
+        背景（对标真实工程后实测）：`参数 := 标识符 (: 类型)?` 早就支持，
+        `Symbol.params` 也存了 `type_ann`，但**调用处从不校验**。后果是
+        「写了标注等于没写」——`请 问候(名字: 文本)` 后 `问候(123)`
+        `检查` 报 0 错，运行必崩。这与本项目「编译期与运行期必须同口径」
+        直接冲突：**能标注不能检查，等于给了假的安全感**。
+
+        口径（保守推断，不误报）：
+          · 只校验**有显式标注**的形参；未标注（`任意`）一律放行。
+          · 实参类型推断为 `任意` 时放行（推不出 ≠ 类型错）。
+          · 用 `can_assign` 判兼容（SPEC §5.4 放宽规则），不重造比较逻辑。
+          · 回调（`函数` 类型）实参只认函数字面量/已定义函数名/`任意`，
+            不深入到签名层面（签名协变是 v0.5 议题）。
+        """
+        callee = node.callee
+        if not isinstance(callee, Identifier):
+            return
+        sym = self.scope.lookup(callee.name)
+        if sym is None or not sym.is_function:
+            return
+        params = sym.params
+        if not params:
+            return
+
+        # 位置实参 → 与形参按序对应（可变参数前的固定形参才校验）
+        for i, arg in enumerate(node.args):
+            if i >= len(params):
+                break
+            p = params[i]
+            if p.is_variadic:
+                break
+            self._check_one_arg_type(sym, p, arg)
+        # 具名实参 → 按名字找形参
+        按名 = {p.name: p for p in params}
+        for kname, kexpr in node.kwargs.items():
+            p = 按名.get(kname)
+            if p is not None and kexpr is not None:
+                self._check_one_arg_type(sym, p, kexpr)
+
+    def _check_one_arg_type(self, sym: Symbol, p, arg) -> None:
+        ann = normalized_type(p.type_ann) if p.type_ann else None
+        if ann is None or ann == ANY:
+            return
+        actual = self.node_types.get(id(arg), ANY)
+        if actual == ANY:
+            return
+        # 回调参数：只要求「是函数」，不比签名（签名协变属 v0.5）
+        if ann == "函数":
+            if actual == "函数":
+                return
+            self.err(E_TYPE_MISMATCH,
+                     f"函数「{sym.name}」的参数「{p.name}」需要「函数」，"
+                     f"但这里给的是「{actual}」。",
+                     arg.span,
+                     ["传入一个函数名，或写 `请 ... 结束` 的匿名形式",
+                      f"参数定义在第 {p.span.line} 行"])
+            return
+        if can_assign(actual, ann):
+            return
+        self.err(E_TYPE_MISMATCH,
+                 f"函数「{sym.name}」的参数「{p.name}」需要「{ann}」，"
+                 f"但这里给的是「{actual}」。",
+                 arg.span,
+                 [f"先转换类型，例如 `转文本(...)` / `转整数(...)`",
+                  f"参数定义在第 {p.span.line} 行"])
 
     def _check_stray_kwargs(self, node: Call) -> None:
         """守卫：**具名参数不得被静默丢弃**。
@@ -1299,20 +1395,26 @@ class Analyzer:
                 return
 
         # 判断是否内置函数 / 内置模块成员
+        # **成员名取源码原文**：`文本.重复` 的 `重复` 是关键字（loop），
+        # 归一名 `callee.name` 会是 `loop`，在成员表里查不到 ⇒ 守卫失效、
+        # 具名参数被静默放过（实测：`文本.重复(甲 是 乙)` 检查报 0 错、
+        # 运行必崩）。与 `_expr_CallTarget` 保持同一口径。
+        成员名 = callee.name_text or callee.name \
+            if isinstance(callee, Member) else callee.name
         is_builtin = (
             isinstance(callee, Identifier) and self.stdlib.has_core(callee.name)
         ) or (
             isinstance(callee, Member)
             and isinstance(callee.target, Identifier)
             and self.stdlib.has_module(callee.target.name)
-            and callee.name in self.stdlib.modules[callee.target.name]
+            and 成员名 in self.stdlib.modules[callee.target.name]
         )
         if not is_builtin:
             return
 
-        display_name = callee.name
+        display_name = 成员名
         if isinstance(callee, Member):
-            display_name = f"{callee.target.name}.{callee.name}"
+            display_name = f"{callee.target.name}.{成员名}"
 
         first = next(iter(node.kwargs.items()))
         self.err(E_ARG_COUNT,
@@ -1421,7 +1523,16 @@ class Analyzer:
                 sym.used = True
             sig = CORE_SIGNATURES.get(callee.name)
             if sig is not None:
-                self._check_arity(callee.name, len(node.args), sig, node.span)
+                # 内置函数**没有参数名**，任何具名参数都不属于它的形参
+                # ⇒ 位置参数个数不足是「具名参数」的必然后果，不是独立
+                # 错误。此处只看 `node.args`，把 kwargs 留给
+                # `_check_stray_kwargs` 统一报「内置函数不支持具名参数」。
+                # 若不这样抑制，`转文本(甲 是 乙)` 会先报一条「需要 1 个
+                # 参数但给了 0 个」——报错点在参数个数，真因却是不该用
+                # 具名参数，用户会被引向错误的修法（SPEC §8.2.5）。
+                if not node.kwargs:
+                    self._check_arity(callee.name, len(node.args), sig,
+                                      node.span)
             return sig[2] if sig else ANY
 
         # 2) 内置模块成员 `模块.函数`
@@ -1440,7 +1551,9 @@ class Analyzer:
                              ["可用成员：" + "、".join(sorted(members))])
                     return ANY
                 sig = MODULE_SIGNATURES.get(f"{mod}.{key}")
-                if sig is not None:
+                if sig is not None and not node.kwargs:
+                    # 同内置核心函数：模块成员也没有参数名，具名参数由
+                    # `_check_stray_kwargs` 统一报，这里不重复报参数个数。
                     self._check_arity(f"{mod}.{key}", len(node.args),
                                       sig, node.span)
                 return sig[2] if sig else ANY

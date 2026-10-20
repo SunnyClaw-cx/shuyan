@@ -109,6 +109,24 @@ def expect_compile_error(source: str, code: str, must_contain: str = "") -> None
             raise Failure(f"报错文案里没有「{must_contain}」：{joined}")
 
 
+def expect_ok(source: str) -> None:
+    """断言源码**编译期无错**（用于「兼容的用法不得被误报」这类负负例）。"""
+    try:
+        tokens = Lexer(source).tokenize()
+        program = Parser(tokens).parse()
+        analyzer = Analyzer(StdLib())
+        _, diags = analyzer.analyze(program)
+    except (LexError, ParseError) as exc:
+        raise Failure("期望通过，却报了词法/语法错："
+                      + " ".join(f"[{d.code}]{d.message}"
+                                 for d in exc.diagnostics))
+    from .diagnostics import Severity
+    errors = [d for d in diags if d.severity is Severity.ERROR]
+    if errors:
+        raise Failure("期望编译期无错，却报了："
+                      + " ".join(f"[{d.code}]{d.message}" for d in errors))
+
+
 def expect_output_with_modules(modules: dict[str, str], raw: str,
                                expected_lines: list[str]) -> None:
     """在临时目录里建模块，运行主程序并断言输出（多文件工程的运行验证）。
@@ -566,6 +584,16 @@ def test_negative_semantic():
     expect_compile_error("输出(长度(1))", "D3004", "长度")
     expect_compile_error('输出(截取(1, 0))', "D3004", "截取")
     expect_compile_error("引入 \"不存在的模块\"", "D3005", "找不到模块")
+    # ---- 用户函数实参类型校验（SPEC §3.6，v0.4.1 补齐）----
+    # 此前参数写了 `: 类型` 却从不校验 ⇒ 检查报 0 错、运行必崩。
+    expect_compile_error("请 f(数量: 整数)\n    返回 数量\n结束\nf([1, 2])\n",
+                         "D3004", "参数「数量」需要「整数」")
+    expect_compile_error("请 f(回调: 函数)\n    返回 1\n结束\nf(123)\n",
+                         "D3004", "需要「函数」")
+    # 兼容的调用**不得**报错（含 §5.4 拓宽：整数 → 文本）
+    expect_ok("请 f(名字: 文本)\n    返回 名字\n结束\n输出(f(123))\n")
+    # 未标注类型的形参一律放行（保守推断）
+    expect_ok("请 f(什么)\n    返回 什么\n结束\n输出(f([1, 2]))\n")
 
 
 @group("负例·一元运算符续行建议")
