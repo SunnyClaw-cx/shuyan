@@ -8,7 +8,7 @@ PY ?= python
 
 .DEFAULT_GOAL := 帮助
 
-.PHONY: 帮助 测试 单元测试 示例 工程 应用自测 探针 检查 词法 语法树 格式化 文档 基准 全量 清理 安装
+.PHONY: 帮助 测试 单元测试 示例 工程 应用自测 界面自测 探针 检查 词法 语法树 界面 格式化 文档 基准 全量 清理 安装
 
 帮助:
 	@echo "枢言（Shuyan）常用任务"
@@ -18,6 +18,7 @@ PY ?= python
 	@echo "  make 示例        运行 examples/ 下全部示例程序"
 	@echo "  make 工程        运行 projects/ 下样例工程的主程序"
 	@echo "  make 应用自测    端到端自测 Web 应用（21 项，真实 HTTP 请求）"
+	@echo "  make 界面自测    桌面工作台无头自测（45 项）"
 	@echo "  make 探针        运行压测探针、企业场景探针与极端形态探针"
 	@echo "  make 检查        静态检查 examples/ 与 projects/（必须零问题）"
 	@echo "  make 文档        从源码重新生成 docs/STDLIB.md"
@@ -49,6 +50,10 @@ PY ?= python
 应用自测:
 	$(PY) projects/留言板/自测.py
 
+# 无 tkinter 时会自动改用带 tkinter 的解释器重跑；找不到则跳过窗口构建
+界面自测:
+	$(PY) tools/gui_selftest.py
+
 探针:
 	$(PY) tools/probe_stress.py
 	$(PY) tools/probe_enterprise.py
@@ -63,6 +68,9 @@ PY ?= python
 语法树:
 	$(PY) sy.py 语法树 examples/你好世界.sy
 
+界面:
+	$(PY) sy.py 界面 examples/你好世界.sy
+
 格式化:
 	$(PY) sy.py 格式化 examples/*.sy --写入
 
@@ -73,7 +81,7 @@ PY ?= python
 	$(PY) benchmarks/run_bench.py
 
 # 提交前必跑：全部通过才算完成
-全量: 测试 单元测试 示例 工程 应用自测 探针 检查 文档 基准
+全量: 测试 单元测试 示例 工程 应用自测 界面自测 探针 检查 文档 基准
 	@echo ""
 	@echo "═══ 全量验证完成 ═══"
 

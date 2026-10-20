@@ -7,6 +7,7 @@
     sy 格式化  <文件> [--写入]    格式化源码（默认打印，--写入 原地修改）
     sy 词法    <文件>            打印记号流（调试词法层）
     sy 语法树  <文件>            打印 AST（调试语法层）
+    sy 界面    [文件]            打开桌面工作台（图形界面）
     sy 测试                      运行内置测试集
     sy 版本                      版本信息
     sy 帮助                      帮助
@@ -21,17 +22,13 @@ import os
 import sys
 
 from . import __version__
-from .ast_nodes import Node
-from .builtins import StdLib
-from .diagnostics import (
-    LexError, ParseError, SemanticError, Severity, render_all,
-)
+from .diagnostics import Severity, render_all
 from .formatter import format_source
-from .interpreter import Interpreter
-from .lexer import Lexer, describe_tokens
+from .lexer import Lexer
 from .linter import lint_source
-from .parser import Parser
-from .semantic import Analyzer
+from .workbench import (
+    LEX, AST, op_ast, op_lex, op_run,
+)
 
 BANNER = """枢言（Shuyan）—— 中文原生编程语言 · 自研编译器工具链"""
 
@@ -46,6 +43,7 @@ HELP = f"""{BANNER}
   格式化   <文件.sy> [--写入]      格式化源码；--写入 表示原地保存
   词法     <文件.sy>              打印记号流
   语法树   <文件.sy>              打印抽象语法树
+  界面     [文件.sy]              打开桌面工作台（图形界面，可选带文件）
   测试                           运行内置测试集
   版本                           显示版本
   帮助                           显示本帮助
@@ -54,13 +52,15 @@ HELP = f"""{BANNER}
   sy 运行 examples/你好世界.sy
   sy 格式化 examples/斐波那契.sy --写入
   sy 检查 examples/中文切分演示.sy
+  sy 界面 examples/你好世界.sy
 
-等价拉丁写法：run / check / fmt / lex / ast / test / version / help
+等价拉丁写法：run / check / fmt / lex / ast / gui / test / version / help
 """
 
 ALIASES = {
     "run": "运行", "check": "检查", "fmt": "格式化", "format": "格式化",
-    "lex": "词法", "ast": "语法树", "test": "测试",
+    "lex": "词法", "ast": "语法树", "gui": "界面", "desktop": "界面",
+    "test": "测试",
     "version": "版本", "--version": "版本", "-v": "版本",
     "help": "帮助", "--help": "帮助", "-h": "帮助",
 }
@@ -91,59 +91,15 @@ def _prepare_console() -> None:
             pass
 
 
-def _compile(source: str, path: str, stdlib: StdLib):
-    """词法 → 语法 → 语义。抛出的异常由调用方渲染。
-
-    语义分析器带上文件名与源码行：被引入模块的诊断会**回流**到同一个
-    诊断列表（见 `semantic._import_module_file_inner`），必须能区分
-    「这条错误来自哪个文件」。
-    """
-    tokens = Lexer(source, path).tokenize()
-    program = Parser(tokens, path).parse()
-    analyzer = Analyzer(stdlib, filename=path,
-                        source_lines=source.splitlines())
-    types, diags = analyzer.analyze(program)
-    errors = [d for d in diags if d.severity is Severity.ERROR]
-    if errors:
-        raise SemanticError(diags)
-    return program, analyzer, diags
-
-
-def _too_deep_diag(source: str):
-    """漏网的 RecursionError → 枢言诊断（与 `linter._too_deep_diag` 同口径）。"""
-    from .diagnostics import Diagnostic, E_TOO_DEEP
-    from .source import Span
-    return Diagnostic(
-        E_TOO_DEEP,
-        "源码嵌套太深，已超出本实现可安全解析的深度。",
-        Span(1, 1, 1, 1), Severity.ERROR,
-        ["把深层嵌套拆成多个中间变量或函数",
-         "括号 / 列表 / 语句块的嵌套层数越少越好",
-         f"（本文件共 {len(source.splitlines())} 行）"],
-    )
-
-
-def _report_too_deep(source: str, path: str) -> int:
-    """渲染「嵌套太深」诊断并返回失败码。"""
-    from .diagnostics import render as _render
-    diag = _too_deep_diag(source)
-    print(_render(diag, source.splitlines()), file=sys.stderr)
-    print("共 1 个错误", file=sys.stderr)
-    return 1
-
-
 def _render_with_files(diags, main_path: str, main_source: str) -> str:
-    """渲染诊断，并把各文件源码喂给渲染器（跨文件定位用）。"""
-    line_map: dict[str, list[str]] = {}
-    for d in diags:
-        if d.file and d.file not in line_map:
-            try:
-                with open(d.file, "r", encoding="utf-8") as f:
-                    line_map[d.file] = f.read().splitlines()
-            except OSError:
-                pass
-    return render_all(diags, main_source, main_file=main_path,
-                      source_line_map=line_map)
+    """渲染诊断（跨文件定位用）。
+
+    **收敛到与图形界面同一条实现**：此前这里自己拼一遍 `line_map`，
+    界面若再拼一遍就是「同一语义两处实现」，迟早分叉。
+    现统一走 `workbench.Outcome.render`。
+    """
+    from .workbench import Outcome
+    return Outcome("", False, "", list(diags), 1, main_path).render(main_source)
 
 
 def cmd_run(args: list[str]) -> int:
@@ -180,30 +136,24 @@ def cmd_run(args: list[str]) -> int:
 
 
 def _run_one(path: str, extra: list[str]) -> int:
+    """运行单个文件。**与图形界面共用 `workbench.op_run`**。
+
+    编译失败时诊断打到 stderr；运行期的程序输出由 `StdLib` 直接写
+    标准输出（`capture=False`），保持命令行「边跑边看」的体验。
+    """
     source = _read_source(path)
-    stdlib = StdLib(argv=extra, base_dir=os.path.dirname(
-        os.path.abspath(path)))
-    try:
-        program, analyzer, diags = _compile(source, path, stdlib)
-    except (LexError, ParseError, SemanticError) as exc:
-        print(_render_with_files(exc.diagnostics, path, source),
+    outcome = op_run(source, path, argv=extra, capture=False)
+    if outcome.diagnostics and outcome.code != 0:
+        # 编译期失败：程序尚未开始运行，诊断是唯一产物
+        print(_render_with_files(outcome.diagnostics, path, source),
               file=sys.stderr)
         return 1
-    except RecursionError:
-        # 兜底：编译阶段漏网的递归溢出转成枢言诊断，绝不把 Python
-        # 堆栈甩给用户（详见 `_too_deep_diag` 的说明）。
-        return _report_too_deep(source, path)
-
-    # 运行期错误与警告分开渲染：警告是提醒，不是故障。
-    # 混在同一段「运行时错误」里会让人误以为程序跑不动了。
-    interp = Interpreter(stdlib, path, source.splitlines(), analyzer)
-    code = interp.run(program)
-    warnings = [d for d in diags if d.severity is Severity.WARNING]
-    if warnings and code == 0:
+    warnings = outcome.warnings
+    if warnings and outcome.code == 0:
         print(f"（{len(warnings)} 条提醒，不影响运行）", file=sys.stderr)
         for w in warnings:
             print(f"  第 {w.span.line} 行：{w.message}", file=sys.stderr)
-    return code
+    return outcome.code
 
 
 def cmd_check(args: list[str]) -> int:
@@ -265,12 +215,11 @@ def cmd_lex(args: list[str]) -> int:
         return 2
     path = args[0]
     source = _read_source(path)
-    try:
-        tokens = Lexer(source, path).tokenize()
-    except LexError as exc:
-        print(render_all(exc.diagnostics, source), file=sys.stderr)
+    outcome = op_lex(source, path)
+    if not outcome.ok:
+        print(render_all(outcome.diagnostics, source), file=sys.stderr)
         return 1
-    print(describe_tokens(tokens))
+    print(outcome.text)
     return 0
 
 
@@ -280,58 +229,23 @@ def cmd_ast(args: list[str]) -> int:
         return 2
     path = args[0]
     source = _read_source(path)
-    try:
-        tokens = Lexer(source, path).tokenize()
-        program = Parser(tokens, path).parse()
-    except (LexError, ParseError) as exc:
-        print(render_all(exc.diagnostics, source), file=sys.stderr)
+    outcome = op_ast(source, path)
+    if not outcome.ok:
+        print(render_all(outcome.diagnostics, source), file=sys.stderr)
         return 1
-    print(_dump_ast(program))
+    print(outcome.text)
     return 0
 
 
-def _dump_ast(node, indent: int = 0, label: str = "") -> str:
-    """把 AST 打印成可读的树形结构。"""
-    pad = "  " * indent
-    name = type(node).__name__
-    extras = []
-    for f in dataclasses.fields(node):
-        if f.name == "span":
-            continue
-        value = getattr(node, f.name)
-        if isinstance(value, (str, int, float, bool)) or value is None:
-            extras.append(f"{f.name}={value!r}")
-    head = f"{pad}{name}"
-    if extras:
-        head += "(" + ", ".join(extras[:6]) + ")"
-    lines = [head]
+def cmd_gui(args: list[str]) -> int:
+    """打开桌面工作台。
 
-    def children_of(n):
-        for f in dataclasses.fields(n):
-            if f.name == "span":
-                continue
-            v = getattr(n, f.name)
-            if isinstance(v, Node):
-                yield v
-            elif isinstance(v, list):
-                for item in v:
-                    if isinstance(item, Node):
-                        yield item
-                    elif isinstance(item, tuple):
-                        for sub in item:
-                            if isinstance(sub, Node):
-                                yield sub
-                            elif isinstance(sub, list):
-                                for s in sub:
-                                    if isinstance(s, Node):
-                                        yield s
-            elif isinstance(v, dict):
-                for x in v.values():
-                    if isinstance(x, Node):
-                        yield x
-    for child in children_of(node):
-        lines.append(_dump_ast(child, indent + 1))
-    return "\n".join(lines)
+    实现全部在 `shuyan.launcher` —— 它会先确认当前解释器能不能建窗口，
+    不行就换一个（tkinter 并非所有 Python 发行版都自带）。
+    本函数只做参数透传，不重复那套探测逻辑。
+    """
+    from .launcher import main as gui_main
+    return gui_main(args)
 
 
 def cmd_test(args: list[str]) -> int:
@@ -359,7 +273,8 @@ def main(argv: list[str] | None = None) -> int:
 
     table = {
         "运行": cmd_run, "检查": cmd_check, "格式化": cmd_format,
-        "词法": cmd_lex, "语法树": cmd_ast, "测试": cmd_test,
+        "词法": cmd_lex, "语法树": cmd_ast, "界面": cmd_gui,
+        "测试": cmd_test,
         "版本": cmd_version, "帮助": lambda a: (print(HELP), 0)[1],
     }
     handler = table.get(command)

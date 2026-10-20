@@ -236,7 +236,7 @@ benchmarks/            性能基准
 
 ## 测试要求
 
-**每次提交前必须跑完全部四项，全部通过方可提交**：
+**每次提交前必须跑完全部五项，全部通过方可提交**：
 
 ```bash
 PY="python"   # 或你的解释器路径
@@ -253,9 +253,16 @@ PY="python"   # 或你的解释器路径
 # 3. 静态检查（必须零问题；**多文件参数会全处理**）
 "$PY" sy.py 检查 examples/*.sy projects/*/*.sy
 
-# 4. 文档同源（API 文档必须与实现一致）
+# 4. 桌面工作台无头自测（45 项；无 tkinter 时自动换解释器重跑）
+"$PY" tools/gui_selftest.py
+
+# 5. 文档同源（API 文档必须与实现一致）
 "$PY" tools/gen_stdlib_doc.py
 ```
+
+数字口径：**自测 60 项、单测 73 项、界面自测 45 项**。
+（单测数 = 自测数 + 13 项结构性检查；改了任何一个都要同步
+`Makefile` / `README.md` / `CHANGELOG.md` / `docs/ROADMAP.md`。）
 
 若你新增了标准化测试，另跑：
 

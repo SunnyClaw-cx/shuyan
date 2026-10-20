@@ -163,6 +163,42 @@ class Parser:
         while self._check_kind(Kind.NEWLINE):
             self._advance()
 
+    def _group_unclosed(self) -> bool:
+        """括号组（调用参数 / 列表 / 映射 / 分组括号）是否**已经断了**。
+
+        判据有**两条**，缺一不可 —— 因为词法器对换行有抑制规则
+        （`Lexer.tokenize`：`paren_depth > 0` 时不发 NEWLINE）：
+
+            ① 当前是 NEWLINE
+               括号已配对、深度归零，语句在此处正常结束 ⇒ 组已断。
+            ② 当前是「语句起始关键字」（`_at_stmt_start`）
+               括号**还没闭合**时换行被词法层抑制掉了，解析层根本看不到
+               NEWLINE；此时只能靠「这句关键字不可能出现在值的位置」
+               来判定 —— 否则 `(1 + 2` 后跟一行 `定义 丁 = 4`，
+               会把 `定义` 当值、并让报错落到那句正确的代码上。
+
+        两条合起来才完备：只有 ① 会漏掉「括号未闭合」的情形，
+        只有 ② 会漏掉「括号已闭合但语句在此收尾」的情形。
+
+        反过来读词法那条抑制规则就是本函数的依据：
+        **括号组内的换行不会出现在记号流里**，故「见到换行」=
+        「组早已闭合」，而不是「组还长着、要跨过去」。原先的
+        `_skip_newlines()` 恰恰把「组已断」误当「组还长」，引发两个
+        实测症状（源码 `输出(甲 + )` 后跟一行 `定义 乙 = 2`）：
+
+        ① 「参数列表未闭合」报在**第 3 行行首**，指着一句完全正确的代码，
+           真因却在第 2 行 —— 把人往错方向带；
+        ② 整行 `定义 乙 = 2` 被**静默丢弃**，语义分析再也看不到它；
+           该行若另有语义错也一并消失，`检查` 反显示「没有发现问题」
+           （静默丢弃比报错危险）。
+
+        改判之后，报错落在未闭合的那个 `(` 上（真因处），且解析从下一行
+        行首继续 —— 一处改动同时消除两个症状。多行参数列表 / 多行列表
+        字面量不受影响：它们的换行本就被词法层抑制，这里看到的是普通
+        记号，两条判据均不成立。
+        """
+        return self._check_kind(Kind.NEWLINE) or self._at_stmt_start()
+
     def _skip_pause(self) -> None:
         """跳过**语句层**的句读逗号（SPEC §2.7 中文特有规则）。
 
@@ -198,8 +234,48 @@ class Parser:
         """记录当前已产生的**错误**条数，供语句层判断「本条是否出错」。"""
         return self._error_count
 
-    def _sync_to_next_line(self, mark: int) -> None:
+    def _no_error_yet(self) -> bool:
+        """本条语句**尚未**报过任何错误 —— 用于避免对同一处「补刀」。
+
+        「一行一错」是 SPEC §8.5 与自测共同守护的口径：一条语句里，
+        能报出最根本的那条错误就够了。同一根因往往有多张面孔，
+        例如 `输出(甲 + )` 既是「`+` 右边缺操作数」，也表现为
+        「参数列表未闭合」—— 两条都报，用户会以为错了两处。
+
+        判据有两条来源，缺一不可：
+          ① 本条语句的错误计数未增长（`_stmt_mark`）；
+          ② `_suppress_followup` 未置位（表达式层已知是同一根因）。
+        仅看 ① 会漏掉「表达式层已判定同源」的情形，仅看 ② 会漏掉
+        「同一条语句里前一段已经报过错」的情形。
+        """
+        return (self._error_count == self._stmt_mark
+                and not self._suppress_followup)
+
+    def _line_end_after(self, i: int) -> int:
+        """返回下标 `i` 所在**逻辑行**的行尾换行记号下标；末行无换行则返回 -1。
+
+        「逻辑行」而非「物理行」：括号开着时词法器不发出换行记号
+        （见 `Lexer.tokenize`），故多行参数列表 / 多行列表字面量在这里
+        会被视作同一逻辑行 —— 这正是恢复点该落的位置。
+        """
+        j = i
+        while j < len(self.toks):
+            if self.toks[j].kind is Kind.NEWLINE:
+                return j
+            if self.toks[j].kind is Kind.EOF:
+                return -1
+            j += 1
+        return -1
+
+    def _sync_to_next_line(self, mark: int, target: int | None = None) -> None:
         """恐慌模式恢复：本条语句期间产生过错误 ⇒ 跳到下一行行首。
+
+        `target` 为**预计算好的恢复点**（语句起始逻辑行的下一行行首）。
+        必须由调用方预先算好，不能在这里现场回退寻找 —— 踩过的坑：
+        曾试图「游标若已越过起始行就退回去重扫」，结果深层嵌套退栈时
+        每层都回退一行、再前进一行，互相覆盖，形成**死循环**
+        （实测 200 层 `如果` 卡住不动，错误数涨到 82 万）。
+        教训：错误恢复**只能单调前进**，任何回退在多层退栈时都会成环。
 
         **为什么必须这样做**：解析器一旦在语句中途出错，后续记号已经
         失去可靠的上下文，继续按原语法硬解析会产生**级联假错误**
@@ -212,8 +288,18 @@ class Parser:
         换来的是**报错数量与用户真实的错误数量成正比** —— 这才是对的取舍。
 
         若本条**没有**出错则原地不动（正常路径零开销）。
+
+        为什么要预计算恢复点：语句解析收尾时会调 `_skip_terminators` 把行尾
+        换行吃掉，于是游标已经落在**下一行行首**；若这时才开始找行尾，
+        找到的是**再下一行**，中间那一整行（可能是完全正确的语句）就被
+        静默丢弃。实测症状：`输出(甲 + )` 后跟 `定义 乙 = 2`，第 3 行整行
+        消失，「检查」反而看不出问题 —— 静默丢弃比报错危险。
         """
         if self._error_count == mark:
+            return
+        if target is not None:
+            if target > self.i:
+                self.i = target
             return
         depth = 0
         while not self._check_kind(Kind.EOF):
@@ -308,6 +394,13 @@ class Parser:
             if tok.kind is Kind.KEYWORD and tok.value in stop_values:
                 break
             before = self.i
+            # **恢复点在此处预计算**：本语句所在逻辑行（括号开着时词法不
+            # 发换行，故多行参数列表算同一逻辑行）的**下一行行首**。
+            # 预计算而非事后回退，是因为恢复只能单调前进 —— 一旦允许回退，
+            # 深层嵌套退栈时每层回退一行、再前进一行会互相覆盖成死循环
+            # （实测 200 层 `如果` 卡死，错误数涨到 82 万）。
+            line_end = self._line_end_after(before)
+            resume = line_end + 1 if line_end >= 0 else None
             mark = self._mark()
             self._stmt_mark = mark
             self._suppress_followup = False
@@ -321,8 +414,11 @@ class Parser:
                 self._advance()
                 self._synchronize()
             else:
-                # 本条语句出错 ⇒ 丢弃本行剩余记号，防止级联假错误
-                self._sync_to_next_line(mark)
+                # 本条语句出错 ⇒ 丢弃本行剩余记号，防止级联假错误。
+                # 恢复点 resume 是**预计算**的「本语句所在逻辑行的下一行行首」；
+                # 若解析已越过它，则**只前进、不回退**（回退会与深层退栈
+                # 互覆成死循环，见 `_sync_to_next_line` 注释）。
+                self._sync_to_next_line(mark, target=resume)
         return stmts
 
     # ------------------------------------------------------------ 单条语句
@@ -1182,9 +1278,18 @@ class Parser:
                 self._advance()
                 return Unary(span=tok.span, op="not", operand=self._parse_expression(80))
             if tok.value == "(":
+                # 分组括号与调用/列表/映射**同一条口径**：括号组内见到换行
+                # 即「本组未闭合」（依据在词法层：括号开着时不发 NEWLINE，
+                # 详见 `_group_unclosed`）。否则会把下一行整行吞掉，
+                # 且报错位置落到那句正确的代码上。
                 self._advance()
                 expr = self._parse_expression()
-                self._expect(")", "括号未闭合，缺少 )")
+                if self._group_unclosed():
+                    if self._no_error_yet():
+                        self._error(E_EXPECTED_TOKEN, "括号未闭合，缺少 )",
+                                    tok.span, ["检查这一行是否漏写了右括号 )"])
+                elif self._no_error_yet():
+                    self._expect(")", "括号未闭合，缺少 )")
                 return expr
             if tok.value == "[":
                 return self._parse_list_literal()
@@ -1251,11 +1356,10 @@ class Parser:
         return InterpolatedString(span=tok.span, parts=parts)
 
     def _parse_call(self, callee: Node) -> Node:
-        self._advance()                  # (
+        open_tok = self._advance()       # (
         args: list[Node] = []
         kwargs: dict[str, Node] = {}
-        self._skip_newlines()
-        unclosed = False
+        unclosed = self._group_unclosed()
         while not self._check(")") and not self._check_kind(Kind.EOF):
             # **参数位置出现「语句起始关键字」⇒ 多半是上一行漏了右括号。**
             #
@@ -1275,7 +1379,9 @@ class Parser:
                 kwargs[name] = self._parse_expression()
             else:
                 args.append(self._parse_expression())
-            self._skip_newlines()
+            if self._group_unclosed():
+                unclosed = True
+                break
             # 参数后面多出一个值记号（如 `输出(2 的 10)`）—— 明确报错，
             # 避免「少算了参数却浑然不知」。
             nxt = self._cur()
@@ -1291,15 +1397,19 @@ class Parser:
                     self._advance()
             if not self._match(","):
                 break
-            self._skip_newlines()
+            if self._group_unclosed():
+                unclosed = True
+                break
         if unclosed:
-            if not self._suppress_followup:
+            if self._no_error_yet():
+                # 位置指向**未闭合的那个 `(`**，而不是给它找了半天配对的
+                # 那个位置 —— 后者常在下一行行首，指着一句正确代码报错。
                 self._error(E_EXPECTED_TOKEN,
                             "函数调用的参数列表未闭合，缺少 )",
-                            self._cur().span,
+                            open_tok.span,
                             ["检查这一行是否漏写了右括号 )",
                              "若参数要写多行，续行不要以 `定义` 等语句关键字开头"])
-        elif not self._suppress_followup:
+        elif self._no_error_yet():
             self._expect(")", "函数调用的参数列表未闭合，缺少 )")
         return Call(span=callee.span, callee=callee, args=args, kwargs=kwargs)
 
@@ -1336,30 +1446,52 @@ class Parser:
     def _parse_list_literal(self) -> Node:
         start = self._advance()          # [
         items = []
-        self._skip_newlines()
+        unclosed = self._group_unclosed()
         while not self._check("]") and not self._check_kind(Kind.EOF):
+            if unclosed or self._at_stmt_start():
+                break
             items.append(self._parse_expression())
-            self._skip_newlines()
+            if self._group_unclosed():
+                unclosed = True
+                break
             if not self._match(","):
                 break
-            self._skip_newlines()
-        self._expect("]", "列表字面量未闭合，缺少 ]")
+            if self._group_unclosed():
+                unclosed = True
+                break
+        if unclosed:
+            if self._no_error_yet():
+                self._error(E_EXPECTED_TOKEN, "列表字面量未闭合，缺少 ]",
+                            start.span, ["检查这一行是否漏写了右括号 ]"])
+        elif self._no_error_yet():
+            self._expect("]", "列表字面量未闭合，缺少 ]")
         return ListLiteral(span=start.span, items=items)
 
     def _parse_map_literal(self) -> Node:
         start = self._advance()          # {
         pairs = []
-        self._skip_newlines()
+        unclosed = self._group_unclosed()
         while not self._check("}") and not self._check_kind(Kind.EOF):
+            if unclosed or self._at_stmt_start():
+                break
             key = self._parse_expression()
             self._expect(":", "映射的键值之间应该是冒号 :")
             value = self._parse_expression()
             pairs.append((key, value))
-            self._skip_newlines()
+            if self._group_unclosed():
+                unclosed = True
+                break
             if not self._match(","):
                 break
-            self._skip_newlines()
-        self._expect("}", "映射字面量未闭合，缺少 }")
+            if self._group_unclosed():
+                unclosed = True
+                break
+        if unclosed:
+            if self._no_error_yet():
+                self._error(E_EXPECTED_TOKEN, "映射字面量未闭合，缺少 }",
+                            start.span, ["检查这一行是否漏写了右括号 }"])
+        elif self._no_error_yet():
+            self._expect("}", "映射字面量未闭合，缺少 }")
         return MapLiteral(span=start.span, pairs=pairs)
 
     def _parse_function_expr(self) -> Node:
