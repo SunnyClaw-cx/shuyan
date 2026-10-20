@@ -208,19 +208,30 @@ def lint_source(source: str, stdlib: StdLib | None = None,
     （SPEC §3.8.1），不是进程当前目录。若此处不设 `base_dir`，
     `sy 检查 projects/x/主程序.sy` 会以 CWD 为基准而找不到同目录的模块 ——
     编译期与运行期口径不一致（`sy 运行` 用的是脚本目录）。
+
+    **语法错与语义错要一起报**（SPEC §8.2 第 5 条「一次编译报告全部错误」）：
+    解析器出错后**仍能产出一棵部分 AST**（行级错误恢复的副产物），
+    故这里不再「一有语法错就整棵树丢掉」，而是**在语法诊断之外继续跑语义分析**，
+    把两类诊断合并返回。否则用户修完语法错再跑一遍才看到语义错，来回两趟。
     """
-    from .diagnostics import LexError, ParseError
+    from .diagnostics import LexError
     from .parser import Parser
     if stdlib is None and filename not in ("<源码>", ""):
         stdlib = StdLib(base_dir=os.path.dirname(os.path.abspath(filename)))
     try:
         tokens = Lexer(source, filename).tokenize()
-        program = Parser(tokens, filename).parse()
+    except LexError as exc:
+        # 词法阶段无法产出记号流 —— 后续语法/语义都无从谈起，只能就此返回。
+        return None, exc.diagnostics
+    except RecursionError:
+        return None, [_too_deep_diag(source)]
+    try:
+        # `parse_recovering`：有语法错也返回部分 AST + 语法诊断，不抛异常。
+        program, parse_diags = Parser(tokens, filename).parse_recovering()
         linter = Linter(stdlib, filename=filename,
                         source_lines=source.splitlines())
-        return program, linter.lint(program, source)
-    except (LexError, ParseError) as exc:
-        return None, exc.diagnostics
+        diags = parse_diags + linter.lint(program, source)
+        return program, _sorted_diags(diags)
     except RecursionError:
         # **兜底**：解析器的嵌套深度守卫（`MAX_NEST_DEPTH`）是**结构相关**
         # 的预算 —— 括号、列表、块嵌套每层消耗的 Python 帧数不同，
@@ -228,3 +239,12 @@ def lint_source(source: str, stdlib: StdLib | None = None,
         # 这里把它转成枢言诊断，而不是让用户看到一段 Python 堆栈。
         # 「守卫负责给好建议，兜底负责绝不崩宿主」，两道并存。
         return None, [_too_deep_diag(source)]
+
+
+def _sorted_diags(diags: list[Diagnostic]) -> list[Diagnostic]:
+    """按（行，列）稳定排序，使语法诊断与语义诊断交错后仍按源码顺序呈现。
+
+    合并两批诊断后若不排序，会出现「第 7 行的错显示在被引用的前置错误之后」
+    这类乱序 —— 用户按行往下改时会对不上。稳定排序保证同行内保持原有次序。
+    """
+    return sorted(diags, key=lambda d: (d.span.line, d.span.col))

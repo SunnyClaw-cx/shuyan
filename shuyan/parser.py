@@ -243,6 +243,29 @@ class Parser:
     # ------------------------------------------------------------ 入口
 
     def parse(self) -> Program:
+        program, diagnostics = self.parse_recovering()
+        if diagnostics:
+            raise ParseError(diagnostics)
+        return program
+
+    def parse_recovering(self) -> tuple[Program, list[Diagnostic]]:
+        """解析并**在出错时也返回部分 AST**（连同诊断），不抛异常。
+
+        为什么需要它：解析器早已实现**行级错误恢复**（`_sync_to_next_line`），
+        遇错后仍能继续解析后续行、产出一棵**部分合法的 AST**。但 `parse()`
+        在末尾一见到诊断就 `raise ParseError`，把整棵树丢掉 ——
+        于是 `lint_source` 直接返回，**语义分析根本不会运行**。
+
+        后果：一个文件里只要有一处语法错误，**同文件所有语义错误全部被吞**。
+        这与 SPEC §8.2 第 5 条「一次编译**报告全部错误**（不遇错即停）」相悖：
+        用户改完语法错再跑，才看到语义错，被迫来回两趟。
+
+        所以这里把「已恢复的部分 AST」交出去，让上层**在语法诊断之外
+        还能跑一遍语义分析**，一次性把两类错误都给到用户。
+
+        `parse()` 保持原语义（有诊断即抛），供运行路径使用 ——
+        运行一个语法错误的程序本就不该继续。
+        """
         body = self._parse_statements(stop_values={"end", "else", "elif",
                                                   "catch", "finally"})
         if not self._check_kind(Kind.EOF):
@@ -254,9 +277,9 @@ class Parser:
                 self._error(E_UNEXPECTED_TOKEN,
                             f"意料之外的记号「{self._cur().text}」。",
                             self._cur().span)
-        if self.diagnostics:
-            raise ParseError(self.diagnostics)
-        return Program(span=body[0].span if body else Span(1, 1, 1, 1), body=body)
+        program = Program(span=body[0].span if body else Span(1, 1, 1, 1),
+                          body=body)
+        return program, list(self.diagnostics)
 
     # ------------------------------------------------------------ 语句序列
 

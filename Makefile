@@ -13,7 +13,7 @@ PY ?= python
 帮助:
 	@echo "枢言（Shuyan）常用任务"
 	@echo ""
-	@echo "  make 测试        运行内置自测（59 项，必须全绿）"
+	@echo "  make 测试        运行内置自测（60 项，必须全绿）"
 	@echo "  make 单元测试    运行 tests/ 下的标准化单元测试"
 	@echo "  make 示例        运行 examples/ 下全部示例程序"
 	@echo "  make 工程        运行 projects/ 下样例工程的主程序"

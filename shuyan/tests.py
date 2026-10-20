@@ -696,6 +696,55 @@ def test_error_recovery_one_per_line():
     expect_eq(_parse_error_lines("定义 甲 = 1\n输出(甲)\n"), [], "正常程序不应有报错")
 
 
+@group("负例·语法错与语义错必须同时报")
+def test_parse_and_semantic_errors_reported_together():
+    """**同文件里语法错与语义错必须一次报全**（SPEC §8.2 第 5 条）。
+
+    实测暴露的缺陷：`lint_source` 在解析阶段一遇诊断就整体返回，
+    **完全不跑语义分析** —— 于是文件里只要有一处语法错，
+    所有语义错全部被吞。用户必须先修语法、重跑、才看到语义错，来回两趟。
+
+    根因：解析器早已实现行级错误恢复、能产出**部分 AST**，
+    却在末尾 `raise ParseError` 把这棵树丢掉。修法是新增
+    `Parser.parse_recovering()`：有诊断也返回 `(部分 AST, 诊断)`，
+    让 `lint_source` 在语法诊断之外继续跑语义分析并合并结果。
+
+    断言用 `lint_source` 的真实输出（用户看到的东西），不看内部实现。
+    """
+    from .linter import lint_source
+
+    # ① 语义错（第 2 行）+ 语法错（第 3 行）⇒ 两条都要有
+    src = '定义 甲 = 1\n甲 是 "文本"\n输出(甲 加 2)\n'
+    _, diags = lint_source(src, filename="<测试>")
+    codes = {d.code for d in diags}
+    expect_eq("D3004" in codes, True,
+              f"语义错 D3004 被语法错吞掉了：{[d.code for d in diags]}")
+    expect_eq("D2001" in codes, True,
+              f"语法错 D2001 丢了：{[d.code for d in diags]}")
+
+    # ② 未定义变量（语义）+ 语法错 ⇒ 都要有，且按行号升序
+    src2 = "输出(未定义变量)\n输出(甲 加 2)\n"
+    _, diags2 = lint_source(src2, filename="<测试>")
+    lines = [d.span.line for d in diags2]
+    expect_eq(lines, sorted(lines), f"诊断未按行号排序：{lines}")
+    codes2 = {d.code for d in diags2}
+    expect_eq("D3005" in codes2, True,
+              f"未定义变量 D3005 被吞：{[d.code for d in diags2]}")
+
+    # ③ 只有语法错的程序（所有名字都已定义）：不得冒出语义诊断
+    #    注意：这里刻意先 `定义` 好名字，否则「未定义」本身是**真**语义错
+    #    （D3005 并非误报）—— 要测的是「合并不得凭空多出语义错」，
+    #    故必须排除掉「名字确实未定义」这一合法来源。
+    _, diags3 = lint_source("定义 甲 = 1\n输出(甲 +)\n", filename="<测试>")
+    codes3 = [d.code for d in diags3]
+    expect_eq(all(c.startswith("D2") for c in codes3), True,
+              f"名字均已定义时仍冒出非语法诊断（疑似误报）：{codes3}")
+
+    # ④ 正确程序零诊断（合并路径不得误伤正常程序）
+    _, diags4 = lint_source("定义 甲 = 1\n输出(甲)\n", filename="<测试>")
+    expect_eq(diags4, [], f"正常程序不应有诊断：{[d.code for d in diags4]}")
+
+
 @group("标准库·幂与函数式写法")
 def test_stdlib_power():
     expect_output("输出(次方(2, 10))", ["1024"])
