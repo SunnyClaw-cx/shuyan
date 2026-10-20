@@ -241,14 +241,15 @@ benchmarks/            性能基准
 ```bash
 PY="python"   # 或你的解释器路径
 
-# 1. 自测（内置，51 项，必须全绿）
+# 1. 自测（内置，52 项，必须全绿）
 "$PY" sy.py 测试
 
-# 2. 示例程序（4 个，必须全部跑通）
+# 2. 示例程序与工程样例（必须全部跑通）
 "$PY" sy.py 运行 examples/*.sy
+"$PY" sy.py 运行 projects/库存管理/主程序.sy
 
-# 3. 静态检查（必须零问题）
-"$PY" sy.py 检查 examples/*.sy
+# 3. 静态检查（必须零问题；**多文件参数会全处理**）
+"$PY" sy.py 检查 examples/*.sy projects/*/*.sy
 
 # 4. 文档同源（API 文档必须与实现一致）
 "$PY" tools/gen_stdlib_doc.py

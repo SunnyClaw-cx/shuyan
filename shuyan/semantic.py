@@ -986,9 +986,18 @@ class Analyzer:
             return "布尔"
         if t in ("整数", "小数", ANY):
             return t
+        hints = ["该运算符需要数字"]
+        # 绝大多数情况下，一元 `+` / `-` 出现在行首并非用户本意，
+        # 而是**长表达式换行时把运算符留在了下一行行首**。枢言的续行规则
+        # 要求运算符留在**上一行行尾**（SPEC §2.7）。这里给出可直接照做的
+        # 改写建议，比只说「需要数字」有用得多。
+        if node.op in ("+", "-"):
+            hints.insert(0, "如果是长表达式换行，请把运算符放在上一行行尾"
+                            "（枢言靠行尾运算符自动续行）；"
+                            "也可以用圆括号把整个表达式括起来")
         self.err(E_TYPE_MISMATCH,
                  f"运算符「{node.op}」不能作用在「{t}」上。",
-                 node.span, ["该运算符需要数字"])
+                 node.span, hints)
         return ANY
 
     def _expr_Binary(self, node: Binary) -> str:

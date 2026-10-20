@@ -116,6 +116,30 @@ def expect_runtime_error(source: str, must_contain: str) -> None:
           f"运行期输出里没有「{must_contain}」：{out[:200]}")
 
 
+def expect_hint(source: str, code: str, must_contain: str) -> None:
+    """验证编译期报错**同时**给出了指定建议（hints）。
+
+    报错文案负责任务定位，**建议**负责告诉用户下一步怎么改。
+    两者都属产品的一部分，都要被锁住——否则改动一来，
+    错误码还在、提示悄悄丢了，没人会发现。
+    """
+    try:
+        tokens = Lexer(source).tokenize()
+        program = Parser(tokens).parse()
+        analyzer = Analyzer(StdLib())
+        _, diags = analyzer.analyze(program)
+    except (LexError, ParseError) as exc:
+        diags = exc.diagnostics
+    errors = [d for d in diags if getattr(d.severity, "name", "") == "ERROR"]
+    if not errors:
+        raise Failure(f"期望报错 {code}，但编译通过了")
+    if code not in [d.code for d in errors]:
+        raise Failure(f"期望错误码 {code}，实际得到 {[d.code for d in errors]}")
+    joined = " ".join(h for d in errors for h in d.hints)
+    if must_contain not in joined:
+        raise Failure(f"报错建议里没有「{must_contain}」：{joined or '(无建议)'}")
+
+
 # ================================================================ 一、词法切分
 
 
@@ -470,6 +494,38 @@ def test_negative_semantic():
     expect_compile_error("输出(长度(1))", "D3004", "长度")
     expect_compile_error('输出(截取(1, 0))', "D3004", "截取")
     expect_compile_error("引入 \"不存在的模块\"", "D3005", "找不到模块")
+
+
+@group("负例·一元运算符续行建议")
+def test_negative_unary_hint():
+    """一元 `+` / `-` 拼到文本上时报错，**必须**附带续行写法建议。
+
+    这是 `projects/留言板/应用.sy` 实际踩过的坑：长表达式换行时把 `+`
+    写在了**下一行行首**。枢言的续行规则要求运算符留在**上一行行尾**
+    （SPEC §2.7），于是行首的 `+` 被当作一元运算符，拼到文本上自然报
+    「运算符不能作用在文本上」——**错误码没错，但定位完全指错了方向**：
+    用户以为是自己把字符串拼错了，实际是换行位置的问题。
+
+    单说「该运算符需要数字」不足以让人改对，故本用例锁住两条：
+    ① 建议里明确指向「放到上一行行尾」；
+    ② 建议里给出「用圆括号括起来」这条同样可用的替代写法。
+    """
+    # 行首 `+` 拼文本
+    expect_hint('定义 甲 = "你好"\n定义 乙: 文本 = 甲\n  + "世界"\n输出(乙)\n',
+                "D3004", "运算符放在上一行行尾")
+    expect_hint('定义 甲 = "你好"\n定义 乙: 文本 = 甲\n  + "世界"\n输出(乙)\n',
+                "D3004", "圆括号")
+
+    # 括号内行首运算符**不应**报错（SPEC §2.7：未闭合括号内部忽略换行）
+    expect_output('定义 甲 = "你好"\n定义 乙: 文本 = (甲\n  + "世界")\n输出(乙)\n',
+                  ["你好世界"])
+
+    # 行尾运算符续行是正确写法，必须畅通
+    expect_output('定义 甲 = "你好"\n定义 乙: 文本 = 甲 +\n  "世界"\n输出(乙)\n',
+                  ["你好世界"])
+
+    # 无续行需求的单行写法不受影响
+    expect_output('定义 甲 = "你好"\n输出(甲 + "世界")\n', ["你好世界"])
 
 
 @group("负例·参数个数")
