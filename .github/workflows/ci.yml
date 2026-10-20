@@ -89,11 +89,21 @@ jobs:
             python sy.py 运行 "$f"
           done
 
-      - name: 静态检查全部示例（必须零问题）
+      - name: 静态检查全部示例与工程（必须零问题）
         shell: bash
         run: |
           set -e
-          python sy.py 检查 examples/*.sy
+          shopt -s globstar nullglob
+          python sy.py 检查 examples/*.sy projects/*/*.sy projects/*/*/*.sy
+
+      - name: 运行全部样例工程的主程序
+        shell: bash
+        run: |
+          set -e
+          python sy.py 运行 projects/库存管理/主程序.sy
+          python sy.py 运行 projects/应收对账/主程序.sy
+          python sy.py 运行 projects/ERP/主程序.sy
+          python sy.py 运行 projects/企业平台/主程序.sy
 
       - name: 校验标准库文档与实现同源
         shell: bash

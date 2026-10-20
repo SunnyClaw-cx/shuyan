@@ -76,7 +76,7 @@ PY ?= python
 	@rm -rf .tmp平台
 
 检查:
-	$(PY) sy.py 检查 examples/*.sy projects/*/*.sy
+	$(PY) sy.py 检查 examples/*.sy projects/*/*.sy projects/*/*/*.sy
 
 词法:
 	$(PY) sy.py 词法 examples/中文切分演示.sy
