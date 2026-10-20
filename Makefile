@@ -47,6 +47,7 @@ PY ?= python
 	$(PY) sy.py 运行 projects/库存管理/主程序.sy
 	$(PY) sy.py 运行 projects/应收对账/主程序.sy
 	$(PY) sy.py 运行 projects/ERP/主程序.sy
+	$(PY) sy.py 运行 projects/企业平台/主程序.sy
 
 应用自测:
 	$(PY) projects/留言板/自测.py
@@ -64,6 +65,8 @@ PY ?= python
 	$(PY) tools/probe_derived_diag.py
 
 # 生成「大厂级中台」工程（确定性），检查 + 运行主程序。
+# 生成器产物已真实落地为 projects/企业平台/（78 文件 / 6.1 万行）；
+# 本目标在临时目录重跑一遍以验证可复现性。
 # 默认 14 域 / 168 实体 / 6 万余行；规模可用参数调整。
 平台:
 	@rm -rf .tmp平台

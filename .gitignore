@@ -84,6 +84,8 @@ projects/**/*.csv
 .tmpbig/
 .tmpprobe/
 .tmpbig_*.log
+# 中台工程生成器的临时产物（由 Makefile 的「平台」目标使用，用完即删）
+.tmp平台/
 
 # ---- 本地私有内容（不入库） ----
 *.local.md
